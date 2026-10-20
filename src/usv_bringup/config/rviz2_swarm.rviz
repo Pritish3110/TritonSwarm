@@ -1,0 +1,80 @@
+Panels:
+  - Class: rviz_common/Displays
+    Help Height: 78
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Ocean Grid1
+        - /Swarm Visuals1
+        - /Global Options1
+      Splitter Ratio: 0.5
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Alpha: 0.35
+      Cell Size: 10
+      Class: rviz_default_plugins/Grid
+      Color: 30; 75; 110
+      Enabled: true
+      Line Style:
+        Line Width: 0.05
+        Value: Lines
+      Name: Ocean Grid
+      Normal Cell Count: 0
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Plane: XY
+      Plane Cell Count: 25
+      Reference Frame: world
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Swarm Visuals
+      Namespaces:
+        {}
+      Topic:
+        Depth: 10
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /usv_swarm/markers
+      Value: true
+  Enabled: true
+  Global Options:
+    Background Color: 8; 15; 32
+    Fixed Frame: world
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz_default_plugins/Interact
+      Hide Inactive Objects: true
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/FocusCamera
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 75.0
+      Enable Stereo Rendering:
+        Stereo Eye Separation: 0.06
+        Stereo Focal Distance: 1.0
+        Swap Stereo Eyes: false
+        Value: false
+      Focal Point:
+        X: 0.0
+        Y: 0.0
+        Z: 1.0
+      Focal Shape Fixed Size: true
+      Focal Shape Size: 0.05
+      Invert Z Axis: false
+      Name: Current View
+      Near Clip Distance: 0.01
+      Pitch: 0.65
+      Target Frame: world
+      Value: Orbit (rviz_default_plugins)
+      Yaw: 0.785
+    Saved: ~

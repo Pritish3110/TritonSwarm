@@ -1,0 +1,36 @@
+# Secrets & Environment Configurations (Strict Rule 3)
+.env
+.env.*
+*.env
+.env.local
+.env.production
+
+# ROS 2 Colcon Build & Install Artifacts
+build/
+install/
+log/
+
+# Python Cache & Testing Artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editor & OS Artifacts
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Temporary & Backup Files
+*.bak
+*.bak*
+*.tmp
+
+# Runtime Logs
+*.log
+Ogre.log

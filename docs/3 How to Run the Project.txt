@@ -1,0 +1,166 @@
+================================================================================
+           USV SWARM CAPSTONE: COMPLETE STEP-BY-STEP RUN GUIDE
+================================================================================
+
+This guide provides the exact commands and terminal layout to run the full
+USV Swarm project and observe all empirical outputs, telemetry streams, and
+3D visualizations.
+
+--------------------------------------------------------------------------------
+RECOMMENDED EXECUTION ORDER & MULTI-TERMINAL SETUP
+--------------------------------------------------------------------------------
+
+  [ Terminal 1 ] --> Stage 1: Unit Tests & 3x3 Benchmark Sweep (Conda Env)
+  [ Terminal 2 ] --> Stage 2: Live ROS 2 Multi-Node Swarm Launch (ROS 2 Env)
+  [ Terminal 3 ] --> Live Telemetry: Section 5 Mission Metrics (/mission/status)
+  [ Terminal 4 ] --> Live Recovery: Fault Diagnosis & Recovery Events (/recovery/event)
+  [ Terminal 5 ] --> 3D Visualization: RViz2 Swarm Display (Optional)
+
+================================================================================
+PHASE 1: RUN STAGE 1 TESTS & BENCHMARKS (TERMINAL 1)
+================================================================================
+
+Open Terminal 1. This runs inside the Conda environment (Python 3.11):
+
+  # 1. Activate Conda environment & navigate to workspace
+  conda activate usv_swarm_env
+  cd "/home/pritish_3110/Personal Files/Syllabus/Projects/Capstone_project/usv_swarm_ws"
+
+  # 2. Run automated regression unit tests (~0.4 seconds)
+  pytest -v tests/test_swarm_core.py
+  (or simply run: ./run_tests.sh)
+
+  # 3. Run Stage 1 Comprehensive 3x3 Fault Sweep Benchmark (~25 seconds)
+  python -m training.scripts.evaluate_stage1
+  (or simply run: ./run_stage1.sh)
+
+  # (Optional) Re-train the XGBoost Fault Diagnosis Classifier:
+  python -m training.scripts.train_diagnosis
+
+WHAT YOU WILL SEE IN TERMINAL 1:
+  - All 6/6 tests passing in 0.36s:
+      * test_vessel_dynamics_rk4_stability PASSED
+      * test_target_reactive_evasion PASSED
+      * test_hungarian_role_allocation_health_demotion PASSED
+      * test_cbf_safety_shield_head_on_collision_invariant PASSED
+      * test_section_5_encirclement_criteria PASSED
+      * test_fault_injector_corruption PASSED
+  - A printed 3x3 benchmark table showing:
+      * 9 fault regimes (0%, 15%, 30% node degradation x 0%, 20%, 40% link loss)
+      * Encirclement success rates and MTTR recovery times
+      * Invariant: 0.0% Collisions across all 9 cells (d >= 4.0m enforced by CBF)
+
+================================================================================
+PHASE 2: RUN STAGE 2 LIVE ROS 2 MULTI-NODE SIMULATION (TERMINALS 2, 3, 4, 5)
+================================================================================
+
+Open Terminals 2, 3, 4, and 5 side-by-side.
+
+--------------------------------------------------------------------------------
+TERMINAL 2 — MAIN ROS 2 SWARM ENGINE (LAUNCH NODE)
+--------------------------------------------------------------------------------
+
+In Terminal 2, launch the entire 7-node distributed ROS 2 stack:
+
+  cd "/home/pritish_3110/Personal Files/Syllabus/Projects/Capstone_project/usv_swarm_ws"
+  source /opt/ros/lyrical/setup.bash
+  source install/setup.bash
+
+  ros2 launch usv_bringup swarm_simulation.launch.py num_agents:=6 target_mode:=reactive
+  (or simply run: ./run_stage2_sim.sh)
+
+WHAT YOU WILL SEE IN TERMINAL 2:
+  - Startup logs for all 7 active ROS 2 nodes:
+      1. usv_sim_core (20 Hz 3-DOF continuous dynamics)
+      2. usv_perception_mesh (10 Hz EKF gossip tracking)
+      3. usv_health_diagnosis (10 Hz residual fault detector)
+      4. usv_recovery_planner (10 Hz Hungarian role manager)
+      5. usv_policy_marl (10 Hz kinematic policy executor)
+      6. usv_safety_shield (20 Hz Control Barrier Function filter)
+      7. usv_fault_injector (Runtime fault schedule coordinator)
+  - At t = 15.0 s: log displaying scheduled thruster failure injection into USV-1.
+
+--------------------------------------------------------------------------------
+TERMINAL 3 — LIVE MISSION STATUS & SECTION 5 METRICS
+--------------------------------------------------------------------------------
+
+In Terminal 3, monitor Section 5 encirclement criteria in real time:
+
+  cd "/home/pritish_3110/Personal Files/Syllabus/Projects/Capstone_project/usv_swarm_ws"
+  source /opt/ros/lyrical/setup.bash
+  source install/setup.bash
+
+  ros2 topic echo /mission/status
+
+WHAT YOU WILL SEE IN TERMINAL 3:
+  Live telemetry stream validating Section 5 criteria:
+    total_agents: 6
+    healthy_agents: 5
+    degraded_agents: 1
+    standoff_radius_mean: 20.08 m       # Target: 20.0 +/- 3.0 m
+    angular_spread: 4.71 rad            # Criterion 1: >= 2*pi*(1 - 1/N) [PASS]
+    max_angular_gap: 1.58 rad           # Criterion 2: <= (2*pi/N) * 1.5 [PASS]
+    criterion_1_satisfied: true
+    criterion_2_satisfied: true
+    target_arrested: true               # Target velocity < 0.20 m/s
+    encirclement_achieved: true         # Section 5 Rubric MET
+    zero_collision_invariant: true      # d_min >= 4.0 m
+    collision_count: 0
+
+--------------------------------------------------------------------------------
+TERMINAL 4 — FAULT RECOVERY & TELEMETRY TRACE
+--------------------------------------------------------------------------------
+
+In Terminal 4, watch the autonomous diagnosis and dynamic role reallocation:
+
+  cd "/home/pritish_3110/Personal Files/Syllabus/Projects/Capstone_project/usv_swarm_ws"
+  source /opt/ros/lyrical/setup.bash
+  source install/setup.bash
+
+  # Watch tactical recovery events:
+  ros2 topic echo /recovery/event
+
+WHAT YOU WILL SEE IN TERMINAL 4:
+  - At t = 15.0 s (fault injection) and t = 18.0 s (diagnosis):
+    usv_health_diagnosis flags USV-1 with degraded health (h1 = 0.50).
+  - usv_recovery_planner applies degradation penalties (+150.0) to ring slots.
+  - Telemetry prints the reallocation event:
+      * USV-1 is demoted from active ring tracker to relay at R = 30.0 m.
+      * Healthy USV-4 is promoted to the R = 20.0 m ring to fill the gap.
+      * Zero human intervention required.
+
+  # (Optional: Watch USV-1 health degradation directly in Terminal 4)
+  ros2 topic echo /usv_1/health
+
+--------------------------------------------------------------------------------
+TERMINAL 5 — HIGH-FIDELITY 3D RVIZ2 GRAPHICAL VISUALIZATION (FLICKER-FREE)
+--------------------------------------------------------------------------------
+
+In Terminal 5, run the dedicated anti-flicker launcher script:
+
+  cd "/home/pritish_3110/Personal Files/Syllabus/Projects/Capstone_project/usv_swarm_ws"
+  ./run_rviz.sh
+
+  (Or manually paste:)
+  source /opt/ros/lyrical/setup.bash
+  source install/setup.bash
+  export QT_QPA_PLATFORM=xcb
+  export __GL_GSYNC_ALLOWED=0
+  export __GL_VRR_ALLOWED=0
+  export __GL_SYNC_TO_VBLANK=0
+  unset OGRE_RTT_MODE
+  export QT_AUTO_SCREEN_SCALE_FACTOR=0
+  export QT_SCALE_FACTOR=1
+  rviz2 -d src/usv_bringup/config/rviz2_swarm.rviz
+
+WHAT YOU WILL SEE IN TERMINAL 5:
+  - 100% Flicker-Free, Anti-Aliased 3D Maritime Workspace in Oceanic Navy:
+      * Compound Target Vessel: Metallic crimson cutter hull, charcoal cabin, radar mast, bow arrow, and floating 3D text billboard ("TARGET [Reactive] | Speed: X.XX m/s").
+      * High-Fidelity USV Hulls: Catamaran twin-pontoons, wheelhouses, masts, and directional bow arrows.
+      * Dynamic Role Color-Coding: Cyan (Trackers), Royal Azure (Interceptors), Amber Gold (Relays), Emerald Green (Scouts).
+      * Flashing Hazard Mode: When USV-1 is degraded, its hull turns hazard-orange and the mast beacon flashes red with a 3D billboard ("⚠️ FAULT: THRUST REDUCED 35%").
+      * Dynamic Radio Gossip Mesh: Real-time glowing cyan network lines connecting vessels within 55m radio range.
+      * Tactical Perimeter Rings: Glowing emerald green 20m standoff ring and translucent 6m arrest capture disk.
+      * Hydrodynamic Stern Wakes: Realistic fading wake trails behind each moving vessel.
+
+================================================================================
