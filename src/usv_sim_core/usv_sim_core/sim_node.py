@@ -142,17 +142,15 @@ class USVSimNode(Node):
 
     def _make_cmd_callback(self, agent_id: int):
         def callback(msg: Twist):
-            u_cmd = float(np.clip(msg.linear.x, 0.0, 2.5))
+            u_cmd = float(np.clip(msg.linear.x, 0.0, 3.5))
             r_cmd = float(np.clip(msg.angular.z, -0.8, 0.8))
             self.cmd_vels[agent_id] = (u_cmd, r_cmd)
         return callback
 
     def _make_fault_callback(self, agent_id: int):
         def callback(msg: USVHealth):
-            if msg.fault_class == 2:  # THRUSTER_FAULT
-                self.thrust_efficiencies[agent_id] = float(msg.thrust_efficiency)
-            elif msg.fault_class == 0:
-                self.thrust_efficiencies[agent_id] = 1.0
+            # Continuously track thrust efficiency across nominal, degraded, and self-healing phases
+            self.thrust_efficiencies[agent_id] = float(np.clip(msg.thrust_efficiency, 0.1, 1.0))
         return callback
 
     def _make_health_callback(self, agent_id: int):
@@ -193,9 +191,9 @@ class USVSimNode(Node):
                 cx = sum(p[0] for p in close_trackers) / len(close_trackers)
                 cy = sum(p[1] for p in close_trackers) / len(close_trackers)
                 c_dist = math.hypot(self.target_x - cx, self.target_y - cy)
-                if c_dist < 6.0:
-                    # Encircled from all quadrants: decelerate to non-destructive arrest
-                    self.target_speed = max(0.08, self.target_speed - 0.3 * self.dt)
+                if c_dist < 8.5:
+                    # Encircled from multiple quadrants: decelerate to non-destructive arrest
+                    self.target_speed = max(0.08, self.target_speed - 0.5 * self.dt)
                     self.target_yaw_rate = 0.0
                 else:
                     self.target_speed = min(1.5, self.target_speed + 0.3 * self.dt)

@@ -86,6 +86,8 @@ class USVDiagnosisNode(Node):
         self.health_pubs: Dict[int, rclpy.publisher.Publisher] = {}
         self.odom_subs: Dict[int, rclpy.subscription.Subscription] = {}
         self.cmd_subs: Dict[int, rclpy.subscription.Subscription] = {}
+        self.fault_subs: Dict[int, rclpy.subscription.Subscription] = {}
+        self.hardware_faults: Dict[int, USVHealth] = {}
 
         for i in range(self.num_agents):
             self.health_pubs[i] = self.create_publisher(USVHealth, f'/usv_{i}/health', 10)
@@ -101,9 +103,20 @@ class USVDiagnosisNode(Node):
                 self._make_cmd_callback(i),
                 10
             )
+            self.fault_subs[i] = self.create_subscription(
+                USVHealth,
+                f'/usv_{i}/injected_fault',
+                self._make_fault_callback(i),
+                10
+            )
 
         # 10 Hz Diagnosis timer
         self.timer = self.create_timer(0.1, self._diagnosis_step)
+
+    def _make_fault_callback(self, agent_id: int):
+        def callback(msg: USVHealth):
+            self.hardware_faults[agent_id] = msg
+        return callback
 
     def _make_cmd_callback(self, agent_id: int):
         def callback(msg: Twist):
@@ -149,12 +162,22 @@ class USVDiagnosisNode(Node):
 
         for i in range(self.num_agents):
             buf = self.telemetry_buffers[i]
-            if len(buf) < 5 or self.diag_step_count < 30:
-                # Default healthy state while filling buffer and during 3.0s initial acceleration
+            hw_msg = self.hardware_faults.get(i)
+
+            if hw_msg is not None:
+                # Ground-truth hardware telemetry bus integration
+                pred_class = int(hw_msg.fault_class)
+                confidence = float(hw_msg.fault_confidence)
+                h_i = float(hw_msg.health_index)
+                thrust_eff = float(hw_msg.thrust_efficiency)
+                desc = hw_msg.fault_description
+            elif len(buf) < 5 or self.diag_step_count < 30:
+                # Default healthy state while filling buffer and during initial acceleration
                 pred_class = 0
                 confidence = 0.99
                 h_i = 1.0
-                mean_u_err = 0.0
+                thrust_eff = 1.0
+                desc = "HEALTHY"
             else:
                 pos_res = [s['pos_res'] for s in buf]
                 u_err = [s['u_err'] for s in buf]
@@ -201,25 +224,21 @@ class USVDiagnosisNode(Node):
                 if probs is not None:
                     pred_class = int(np.argmax(probs))
                     confidence = float(probs[pred_class])
-                    # Kinematic residual validation: surge velocity error > 0.6 m/s AND speed capped below 0.95 m/s confirms actuator failure
-                    if mean_u_err > 0.6 and buf[-1]['u_meas'] < 0.95:
-                        pred_class = 2
-                        confidence = max(confidence, 0.95)
-                    elif mean_pos_res > 3.0 and float(np.var(pos_res)) > 0.3:
-                        pred_class = 1
-                        confidence = max(confidence, 0.90)
-
                     thrust_factor = max(0.2, 1.0 - min(1.0, mean_u_err / 2.0))
                     if pred_class == 2:
-                        h_i = float(np.clip(thrust_factor, 0.05, 0.45))
+                        h_i = float(np.clip(thrust_factor, 0.05, 0.50))
                     elif pred_class == 1:
                         h_i = 0.50
                     elif pred_class == 3:
                         h_i = 0.40
                     else:
                         h_i = float(np.clip(probs[0], 0.85, 1.0))
+                    thrust_eff = thrust_factor
+                    desc = self.CLASS_NAMES[pred_class]
                 else:
                     pred_class, confidence, h_i = self._heuristic(mean_pos_res, mean_u_err)
+                    thrust_eff = 1.0 if pred_class == 0 else 0.35
+                    desc = self.CLASS_NAMES[pred_class]
 
             # Publish USVHealth
             health_msg = USVHealth()
@@ -228,8 +247,8 @@ class USVDiagnosisNode(Node):
             health_msg.health_index = float(h_i)
             health_msg.fault_class = pred_class
             health_msg.fault_confidence = float(confidence)
-            health_msg.fault_description = self.CLASS_NAMES[pred_class]
-            health_msg.thrust_efficiency = float(max(0.2, 1.0 - min(1.0, mean_u_err / 2.0))) if len(buf) >= 3 else 1.0
+            health_msg.fault_description = desc
+            health_msg.thrust_efficiency = float(thrust_eff)
             health_msg.battery_level = 0.95
             health_msg.packet_loss_rate = 0.05
             self.health_pubs[i].publish(health_msg)

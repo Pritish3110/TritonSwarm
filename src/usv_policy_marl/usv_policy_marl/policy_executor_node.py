@@ -173,8 +173,8 @@ class USVPolicyExecutorNode(Node):
 
         if dists_to_target:
             mean_dist = float(np.mean(dists_to_target))
-            # Approach telemetry logged periodically during convergence
-            if self.sim_step_count % 15 == 0 and t_sec <= 14.0:
+            # Approach telemetry logged periodically throughout simulation
+            if self.sim_step_count % 15 == 0:
                 self.get_logger().info(
                     f"[FA-MAPPO CONVERGENCE] t={t_sec:4.1f}s | Fleet Mean Distance: {mean_dist:5.1f}m -> 20m ring | "
                     f"Active Policy: {'FA-MAPPO (fa_mappo_actor.npz)' if self.policy_weights else 'Proportional Guidance'}"
@@ -208,19 +208,55 @@ class USVPolicyExecutorNode(Node):
 
             dx = gx - x
             dy = gy - y
+
+            # Circumferential perimeter navigation: prevent cutting across the target core
+            if i in self.target_beliefs:
+                tx, ty, _, _ = self.target_beliefs[i]
+                d_to_tgt = math.hypot(x - tx, y - ty)
+                d_goal_to_tgt = math.hypot(gx - tx, gy - ty)
+
+                # Check if path crosses through target inner perimeter
+                theta_agent = math.atan2(y - ty, x - tx)
+                theta_goal = math.atan2(gy - ty, gx - tx)
+                ang_diff = (theta_goal - theta_agent + math.pi) % (2.0 * math.pi) - math.pi
+
+                if abs(ang_diff) > (math.pi / 3.0) and d_to_tgt < 26.0 and d_goal_to_tgt < 26.0:
+                    # Steer along circle circumference towards goal
+                    steer_dir = 1.0 if ang_diff > 0 else -1.0
+                    tangent_ang = theta_agent + steer_dir * (math.pi / 2.0)
+                    wp_x = tx + 20.0 * math.cos(tangent_ang)
+                    wp_y = ty + 20.0 * math.sin(tangent_ang)
+                    dx = wp_x - x
+                    dy = wp_y - y
+                elif d_to_tgt < 16.0:
+                    # Radial push outward if closer than 16m
+                    rad_push = (16.0 - d_to_tgt) * 2.0
+                    dx += math.cos(theta_agent) * rad_push
+                    dy += math.sin(theta_agent) * rad_push
+
             dist = math.hypot(dx, dy)
             target_heading = math.atan2(dy, dx)
             heading_err = (target_heading - psi + math.pi) % (2 * math.pi) - math.pi
 
-            # Proportional slot speed profile
-            if dist > 8.0:
-                speed_des = 2.4
-            elif dist < 1.0:
-                speed_des = max(0.0, 0.5 * dist)
-            else:
-                speed_des = max(0.3, 2.4 * (dist / 8.0))
+            # High-responsiveness slot pursuit profile
+            is_degraded = h_i < 0.55
+            facing_factor = max(0.2, math.cos(heading_err))
 
-            slot_r = float(np.clip(heading_err * 1.8, -0.8, 0.8))
+            if is_degraded:
+                # Safe transit velocity for degraded vessel peeling off to outer standoff
+                speed_des = max(0.4, 1.0 * (h_i / 0.55)) * facing_factor
+            elif dist > 12.0:
+                # Fast intercept sprint to close standoff rapidly
+                speed_des = 3.2 * facing_factor
+            elif dist > 3.0:
+                # Smooth quadratic decel into orbit matching target velocity (~1.2 - 1.4 m/s)
+                alpha = (dist - 3.0) / 9.0
+                speed_des = (1.3 + 1.9 * (alpha ** 1.5)) * facing_factor
+            else:
+                # Precision slot stationkeeping
+                speed_des = max(0.1, 1.3 * (dist / 3.0))
+
+            slot_r = float(np.clip(heading_err * 2.2, -0.8, 0.8))
 
             if self.policy_weights is not None:
                 # Assemble 35-dimensional FA-MAPPO observation vector
@@ -262,21 +298,27 @@ class USVPolicyExecutorNode(Node):
 
                 marl_u, marl_r = self._forward_marl_policy(obs)
 
-                # Blend FA-MAPPO velocity & coordination with geometric slot heading guidance
-                if dist < 1.0:
-                    u_cmd = float(max(0.0, 0.5 * dist))
-                    r_cmd = float(np.clip(heading_err * 0.8, -0.3, 0.3))
-                elif dist < 4.0:
-                    blend = dist / 4.0
-                    u_cmd = float(blend * (0.5 * marl_u + 0.5 * speed_des * min(1.0, h_i * 1.2)) + (1.0 - blend) * max(0.2, 0.6 * dist))
-                    r_cmd = float(np.clip(blend * (0.8 * slot_r + 0.2 * marl_r) + (1.0 - blend) * heading_err * 1.0, -0.6, 0.6))
+                # Decoupled transit vs. formation blending
+                if dist > 6.0:
+                    # Standoff transit phase: prioritize rapid slot intercept
+                    u_cmd = float(0.85 * speed_des + 0.15 * marl_u)
+                    r_cmd = float(np.clip(0.85 * slot_r + 0.15 * marl_r, -0.8, 0.8))
+                elif dist > 1.5:
+                    # Encirclement capture zone: blend MARL formation holding with slot guidance
+                    blend = (dist - 1.5) / 4.5
+                    u_cmd = float(blend * (0.6 * speed_des + 0.4 * marl_u) + (1.0 - blend) * max(0.2, 0.8 * dist))
+                    r_cmd = float(np.clip(0.6 * slot_r + 0.4 * marl_r, -0.8, 0.8))
                 else:
-                    u_cmd = float(0.5 * marl_u + 0.5 * speed_des * min(1.0, h_i * 1.2))
-                    r_cmd = float(np.clip(0.8 * slot_r + 0.2 * marl_r, -0.8, 0.8))
+                    # Close stationkeeping in slot
+                    u_cmd = float(max(0.0, 0.6 * dist))
+                    r_cmd = float(np.clip(heading_err * 1.2, -0.5, 0.5))
             else:
                 # Proportional guidance fallback
-                u_cmd = float(speed_des * min(1.0, h_i * 1.2))
+                u_cmd = float(speed_des)
                 r_cmd = slot_r
+
+            if is_degraded:
+                u_cmd = min(u_cmd, 1.0)
 
             # Publish nominal command
             cmd = Twist()

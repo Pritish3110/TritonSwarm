@@ -92,7 +92,7 @@ class USVSafetyShieldNode(Node):
 
             ax, ay, apsi = self.agent_poses[i]
             u_nom, r_nom = self.nominal_cmds[i]
-            u_safe = float(np.clip(u_nom, 0.0, 2.5))
+            u_safe = float(np.clip(u_nom, 0.0, 3.5))
             r_safe = float(np.clip(r_nom, -0.8, 0.8))
 
             for j in range(self.num_agents):
@@ -112,13 +112,15 @@ class USVSafetyShieldNode(Node):
                     margin = max(0.0, dist - self.d_safe)
                     scaling = margin / max(0.1, self.d_warning - self.d_safe)
 
-                    # Omnidirectional barrier: decelerate and steer away
-                    u_safe = min(u_safe, 2.5 * scaling)
+                    # Directional CBF barrier: only decelerate if obstacle/ally is in forward sector
+                    if is_ahead:
+                        u_safe = min(u_safe, 3.5 * scaling)
+
                     steer_dir = -1.0 if rel_bearing >= 0 else 1.0
                     evasion_r = steer_dir * 0.8 * (1.0 - scaling)
                     r_safe = float(np.clip(0.3 * r_safe + 0.7 * evasion_r, -0.8, 0.8))
 
-                    if dist <= self.d_safe + 1.0:
+                    if dist <= self.d_safe + 1.0 and is_ahead:
                         u_safe = 0.0
                         r_safe = steer_dir * 0.8
 
