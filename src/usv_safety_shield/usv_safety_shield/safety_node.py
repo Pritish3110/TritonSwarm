@@ -1,19 +1,22 @@
 """
 USV Swarm Simulation - ROS 2 Control Barrier Function (CBF) Safety Shield Node
 Author: Principal Enterprise Engineer
-Stage: 2 (Hard Safety Enforcement)
+Stage: 2 (Hard Safety Enforcement, Multi-Target)
 
 Responsibilities:
 - Intercepts nominal policy actions on /usv_{i}/cmd_vel_nominal
-- Evaluates pairwise barrier function h_ij = ||p_i - p_j||^2 - d_safe^2 >= 0
+- Evaluates the tiered barrier set in barriers.py against every hostile and every ally
 - Modulates surge speed and injects evasive yaw if separation is threatened
 - Publishes collision-free commands to /usv_{i}/cmd_vel
-- Invariant: Zero inter-vessel collisions (d >= 4.0m)
+- Invariants:
+    * Zero inter-vessel collisions (d >= 4.0 m), never relaxed for any role or phase
+    * Non-interceptors hold 14.0 m off EVERY hostile
+    * An interceptor's 4.2 m capture corridor applies only to its ASSIGNED hostile
 """
 
 from __future__ import annotations
 import math
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 import rclpy
@@ -22,30 +25,48 @@ from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from usv_msgs.msg import RoleAssignment
 
+from usv_safety_shield.barriers import (
+    D_CAPTURE,
+    D_EXCLUSION,
+    TargetObstacle,
+    filter_command,
+)
+
 
 class USVSafetyShieldNode(Node):
-    """ROS 2 Node enforcing hard CBF safety invariants between swarm USVs and target vessel."""
+    """ROS 2 Node enforcing hard CBF safety invariants across the swarm and all hostiles."""
 
     def __init__(self):
         super().__init__('usv_safety_shield_node')
 
-        self.declare_parameter('num_agents', 6)
+        self.declare_parameter('num_agents', 12)
+        self.declare_parameter('num_targets', 3)
         self.declare_parameter('d_safe', 4.0)
         self.declare_parameter('d_warning', 8.0)
 
         self.num_agents = self.get_parameter('num_agents').get_parameter_value().integer_value
+        self.num_targets = max(1, self.get_parameter('num_targets').get_parameter_value().integer_value)
         self.d_safe = self.get_parameter('d_safe').get_parameter_value().double_value
         self.d_warning = self.get_parameter('d_warning').get_parameter_value().double_value
 
         self.get_logger().info(
-            f"Initializing USVSafetyShieldNode for {self.num_agents} vessels. "
-            f"d_safe={self.d_safe}m, d_warning={self.d_warning}m"
+            f"Initializing USVSafetyShieldNode for {self.num_agents} vessels and "
+            f"{self.num_targets} hostiles. d_safe={self.d_safe}m, d_warning={self.d_warning}m, "
+            f"exclusion={D_EXCLUSION}m, capture_corridor={D_CAPTURE}m"
         )
 
         self.agent_poses: Dict[int, Tuple[float, float, float]] = {}
-        self.agent_roles: Dict[int, str] = {i: "tracker" if i > 0 and i < 4 else ("interceptor" if i == 0 else "scout") for i in range(self.num_agents)}
+        self.agent_vels: Dict[int, Tuple[float, float]] = {}
+        self.agent_roles: Dict[int, str] = {i: "tracker" for i in range(self.num_agents)}
+        self.agent_targets: Dict[int, int] = {i: 0 for i in range(self.num_agents)}
         self.nominal_cmds: Dict[int, Tuple[float, float]] = {i: (0.0, 0.0) for i in range(self.num_agents)}
-        self.target_pose: Optional[Tuple[float, float, float]] = None
+        self.target_poses: Dict[int, Tuple[float, float]] = {}
+        self.target_vels: Dict[int, Tuple[float, float]] = {}
+
+        # Worst-case telemetry for the invariant audit.
+        self.worst_ally_sep = float('inf')
+        self.worst_envelope = float('inf')
+        self.breach_logged = False
 
         self.odom_subs: Dict[int, rclpy.subscription.Subscription] = {}
         self.nominal_subs: Dict[int, rclpy.subscription.Subscription] = {}
@@ -54,50 +75,46 @@ class USVSafetyShieldNode(Node):
 
         for i in range(self.num_agents):
             self.odom_subs[i] = self.create_subscription(
-                Odometry,
-                f'/usv_{i}/odom',
-                self._make_odom_cb(i),
-                10
+                Odometry, f'/usv_{i}/odom', self._make_odom_cb(i), 10
             )
             self.nominal_subs[i] = self.create_subscription(
-                Twist,
-                f'/usv_{i}/cmd_vel_nominal',
-                self._make_nominal_cb(i),
-                10
+                Twist, f'/usv_{i}/cmd_vel_nominal', self._make_nominal_cb(i), 10
             )
             self.role_subs[i] = self.create_subscription(
-                RoleAssignment,
-                f'/usv_{i}/role',
-                self._make_role_cb(i),
-                10
+                RoleAssignment, f'/usv_{i}/role', self._make_role_cb(i), 10
             )
-            self.safe_pubs[i] = self.create_publisher(
-                Twist,
-                f'/usv_{i}/cmd_vel',
-                10
-            )
+            self.safe_pubs[i] = self.create_publisher(Twist, f'/usv_{i}/cmd_vel', 10)
 
-        self.target_sub = self.create_subscription(
-            Odometry,
-            '/target/odom',
-            self._target_odom_cb,
-            10
-        )
+        self.target_subs: Dict[int, rclpy.subscription.Subscription] = {}
+        for m in range(self.num_targets):
+            self.target_subs[m] = self.create_subscription(
+                Odometry, f'/target_{m}/odom', self._make_target_cb(m), 10
+            )
 
         # 20 Hz CBF Evaluation Loop
         self.timer = self.create_timer(0.05, self._cbf_step)
 
-    def _target_odom_cb(self, msg: Odometry):
-        tx = msg.pose.pose.position.x
-        ty = msg.pose.pose.position.y
-        qz = msg.pose.pose.orientation.z
-        qw = msg.pose.pose.orientation.w
-        tpsi = 2.0 * math.atan2(qz, qw)
-        self.target_pose = (tx, ty, tpsi)
+    # ------------------------------------------------------------------
+    # Subscriptions
+    # ------------------------------------------------------------------
+    def _make_target_cb(self, target_id: int):
+        def callback(msg: Odometry):
+            self.target_poses[target_id] = (
+                msg.pose.pose.position.x, msg.pose.pose.position.y
+            )
+            # Odometry carries body-frame surge; the barrier needs world-frame velocity so it
+            # can tell a hostile running the vessel down from one opening the range.
+            qz = msg.pose.pose.orientation.z
+            qw = msg.pose.pose.orientation.w
+            psi = 2.0 * math.atan2(qz, qw)
+            speed = msg.twist.twist.linear.x
+            self.target_vels[target_id] = (speed * math.cos(psi), speed * math.sin(psi))
+        return callback
 
     def _make_role_cb(self, agent_id: int):
         def callback(msg: RoleAssignment):
             self.agent_roles[agent_id] = msg.role.lower()
+            self.agent_targets[agent_id] = int(msg.assigned_target_id)
         return callback
 
     def _make_odom_cb(self, agent_id: int):
@@ -108,6 +125,8 @@ class USVSafetyShieldNode(Node):
             qw = msg.pose.pose.orientation.w
             psi = 2.0 * math.atan2(qz, qw)
             self.agent_poses[agent_id] = (x, y, psi)
+            surge = msg.twist.twist.linear.x
+            self.agent_vels[agent_id] = (surge * math.cos(psi), surge * math.sin(psi))
         return callback
 
     def _make_nominal_cb(self, agent_id: int):
@@ -115,99 +134,76 @@ class USVSafetyShieldNode(Node):
             self.nominal_cmds[agent_id] = (msg.linear.x, msg.angular.z)
         return callback
 
+    # ------------------------------------------------------------------
+    # Barrier evaluation
+    # ------------------------------------------------------------------
     def _cbf_step(self):
+        obstacles: List[TargetObstacle] = [
+            TargetObstacle(
+                target_id=m, x=pos[0], y=pos[1],
+                vx=self.target_vels.get(m, (0.0, 0.0))[0],
+                vy=self.target_vels.get(m, (0.0, 0.0))[1],
+            )
+            for m, pos in sorted(self.target_poses.items())
+        ]
+
         for i in range(self.num_agents):
             if i not in self.agent_poses:
                 continue
 
             ax, ay, apsi = self.agent_poses[i]
             role = self.agent_roles.get(i, "tracker")
+            assigned = self.agent_targets.get(i, 0)
             u_nom, r_nom = self.nominal_cmds[i]
-            u_safe = float(np.clip(u_nom, 0.0, 3.5))
-            r_safe = float(np.clip(r_nom, -0.8, 0.8))
 
-            # -------------------------------------------------------------
-            # 1. HARD CBF TARGET BARRIER (Prevents Target Overlay / Collisions)
-            # -------------------------------------------------------------
-            if self.target_pose is not None:
-                tx, ty, _ = self.target_pose
-                dx_t = tx - ax
-                dy_t = ty - ay
-                dist_tgt = math.hypot(dx_t, dy_t)
-                angle_to_tgt = math.atan2(dy_t, dx_t)
-                rel_bearing_t = (angle_to_tgt - apsi + math.pi) % (2.0 * math.pi) - math.pi
-                is_heading_to_tgt = abs(rel_bearing_t) < (math.pi / 2.0)
+            allies = {
+                j: (self.agent_poses[j][0], self.agent_poses[j][1])
+                for j in range(self.num_agents)
+                if j != i and j in self.agent_poses
+            }
+            ally_vels = {
+                j: self.agent_vels.get(j, (0.0, 0.0))
+                for j in allies
+            }
 
-                if "interceptor" in role:
-                    # Interceptor has dynamic terminal capture corridor: d_safe=4.2m, d_warn=6.5m
-                    d_safe_cap = 4.2
-                    d_warn_cap = 6.5
-                    if dist_tgt < d_warn_cap and is_heading_to_tgt:
-                        margin_cap = max(0.0, dist_tgt - d_safe_cap)
-                        scale_cap = margin_cap / max(0.1, d_warn_cap - d_safe_cap)
-                        u_safe = min(u_safe, 1.2 + 2.3 * scale_cap)
-                        if dist_tgt <= d_safe_cap:
-                            u_safe = 0.0
-                            steer_tangent = -1.0 if rel_bearing_t >= 0 else 1.0
-                            r_safe = steer_tangent * 0.8
-                else:
-                    # Non-interceptors (trackers, relays, scouts) have hard 14.0m exclusion envelope
-                    d_safe_env = 14.0
-                    d_warn_env = 18.0
-                    if dist_tgt < d_warn_env and is_heading_to_tgt:
-                        margin_env = max(0.0, dist_tgt - d_safe_env)
-                        scale_env = margin_env / max(0.1, d_warn_env - d_safe_env)
-                        u_safe = min(u_safe, 3.5 * scale_env)
-                        steer_away = -1.0 if rel_bearing_t >= 0 else 1.0
-                        r_safe = float(np.clip(0.3 * r_safe + 0.7 * steer_away * 0.8, -0.8, 0.8))
-                        if dist_tgt <= d_safe_env:
-                            u_safe = 0.0
-                            r_safe = steer_away * 0.8
+            result = filter_command(
+                own_pos=(ax, ay),
+                own_psi=apsi,
+                u_nominal=u_nom,
+                r_nominal=r_nom,
+                role=role,
+                assigned_target_id=assigned,
+                targets=obstacles,
+                ally_positions=allies,
+                ally_velocities=ally_vels,
+                d_safe=self.d_safe,
+                d_warning=self.d_warning,
+            )
 
-            # -------------------------------------------------------------
-            # 2. HARD CBF INTER-ALLY PAIRWISE BARRIER (Prevents Cramping)
-            # -------------------------------------------------------------
-            for j in range(self.num_agents):
-                if i == j or j not in self.agent_poses:
-                    continue
+            if result.min_ally_dist != float('inf'):
+                self.worst_ally_sep = min(self.worst_ally_sep, result.min_ally_dist)
+            if result.min_target_dist != float('inf'):
+                self.worst_envelope = min(self.worst_envelope, result.min_target_dist)
 
-                ox, oy, _ = self.agent_poses[j]
-                dx = ox - ax
-                dy = oy - ay
-                dist = math.hypot(dx, dy)
+            if result.min_ally_dist < self.d_safe and not self.breach_logged:
+                self.breach_logged = True
+                self.get_logger().error(
+                    f"[INVARIANT BREACH] USV-{i} inter-ally separation "
+                    f"{result.min_ally_dist:.2f}m < d_safe {self.d_safe:.1f}m"
+                )
 
-                if dist < self.d_warning:
-                    angle_to_other = math.atan2(dy, dx)
-                    rel_bearing = (angle_to_other - apsi + math.pi) % (2.0 * math.pi) - math.pi
-                    is_ahead = abs(rel_bearing) < (math.pi / 2.0)
-
-                    margin = max(0.0, dist - self.d_safe)
-                    scaling = margin / max(0.1, self.d_warning - self.d_safe)
-
-                    if is_ahead:
-                        u_safe = min(u_safe, 3.5 * scaling)
-
-                    steer_dir = -1.0 if rel_bearing >= 0 else 1.0
-                    evasion_r = steer_dir * 0.8 * (1.0 - scaling)
-                    r_safe = float(np.clip(0.2 * r_safe + 0.8 * evasion_r, -0.8, 0.8))
-
-                    # Hard proximity safety boundary
-                    if dist <= self.d_safe + 0.8 and is_ahead:
-                        u_safe = 0.0
-                        r_safe = steer_dir * 0.8
-                    elif dist <= self.d_safe + 0.3:
-                        # Lateral repulsion even if not directly ahead
-                        r_safe = steer_dir * 0.8
-
-            if u_safe < u_nom or abs(r_safe - r_nom) > 0.15:
+            if result.interventions:
                 self.get_logger().info(
-                    f"[CBF INTERVENTION] USV-{i}({role}) collision-prevention: u_cmd: {u_nom:.2f}->{u_safe:.2f}, r_cmd: {r_nom:.2f}->{r_safe:.2f}",
+                    f"[CBF] USV-{i}({role}->T{assigned}) u: {u_nom:.2f}->{result.u_safe:.2f}, "
+                    f"r: {r_nom:.2f}->{result.r_safe:.2f} | "
+                    f"ally {result.min_ally_dist:.1f}m tgt {result.min_target_dist:.1f}m | "
+                    f"{','.join(result.interventions[:3])}",
                     throttle_duration_sec=2.0
                 )
 
             cmd = Twist()
-            cmd.linear.x = float(u_safe)
-            cmd.angular.z = float(r_safe)
+            cmd.linear.x = float(result.u_safe)
+            cmd.angular.z = float(result.r_safe)
             self.safe_pubs[i].publish(cmd)
 
 

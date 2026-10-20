@@ -8,6 +8,19 @@ Panels:
         - /Swarm Visuals1
         - /Global Options1
       Splitter Ratio: 0.5
+    Tree Height: 640
+  - Class: rviz_common/Views
+    Expanded:
+      - /Current View1
+    Name: Views
+    Splitter Ratio: 0.5
+  - Class: rviz_common/Tool Properties
+    Expanded:
+      - /Move Camera1
+    Name: Tool Properties
+    Splitter Ratio: 0.6
+  - Class: rviz_common/Selection
+    Name: Selection
 Visualization Manager:
   Class: ""
   Displays:
@@ -26,7 +39,7 @@ Visualization Manager:
         Y: 0
         Z: 0
       Plane: XY
-      Plane Cell Count: 25
+      Plane Cell Count: 45
       Reference Frame: world
       Value: true
     - Class: rviz_default_plugins/MarkerArray
@@ -49,16 +62,21 @@ Visualization Manager:
     Frame Rate: 30
   Name: root
   Tools:
+    # MoveCamera is listed FIRST so it is the tool RViz activates on start-up. With Interact
+    # first, left-drag is consumed by interactive-marker picking and the camera will not orbit.
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Select
     - Class: rviz_default_plugins/Interact
       Hide Inactive Objects: true
-    - Class: rviz_default_plugins/MoveCamera
-    - Class: rviz_default_plugins/Select
-    - Class: rviz_default_plugins/FocusCamera
+  Transformation:
+    Current:
+      Class: rviz_default_plugins/TF
   Value: true
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 75.0
+      Distance: 190.0
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.06
         Stereo Focal Distance: 1.0
@@ -67,14 +85,97 @@ Visualization Manager:
       Focal Point:
         X: 0.0
         Y: 0.0
-        Z: 1.0
+        Z: 2.0
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05
       Invert Z Axis: false
       Name: Current View
-      Near Clip Distance: 0.01
+      # Wide clip range: the battle box spans ~400 m, so a tight far-clip would cull the
+      # outer pickets and a tight near-clip would fight the scroll-wheel zoom.
+      Near Clip Distance: 0.1
       Pitch: 0.65
       Target Frame: world
       Value: Orbit (rviz_default_plugins)
       Yaw: 0.785
-    Saved: ~
+    Saved:
+      - Class: rviz_default_plugins/Orbit
+        Distance: 190.0
+        Focal Point:
+          X: 0.0
+          Y: 0.0
+          Z: 2.0
+        Focal Shape Fixed Size: true
+        Focal Shape Size: 0.05
+        Invert Z Axis: false
+        Name: 1 Battle Overview
+        Near Clip Distance: 0.1
+        Pitch: 0.65
+        Target Frame: world
+        Yaw: 0.785
+      - Class: rviz_default_plugins/Orbit
+        Distance: 260.0
+        Focal Point:
+          X: 0.0
+          Y: 0.0
+          Z: 0.0
+        Focal Shape Fixed Size: true
+        Focal Shape Size: 0.05
+        Invert Z Axis: false
+        Name: 2 Tactical Plan View
+        Near Clip Distance: 0.1
+        Pitch: 1.5697
+        Target Frame: world
+        Yaw: 1.5708
+      - Class: rviz_default_plugins/Orbit
+        Distance: 70.0
+        Focal Point:
+          X: 0.0
+          Y: 0.0
+          Z: 1.5
+        Focal Shape Fixed Size: true
+        Focal Shape Size: 0.05
+        Invert Z Axis: false
+        Name: 3 Engagement Close-Up
+        Near Clip Distance: 0.1
+        Pitch: 0.28
+        Target Frame: world
+        Yaw: 2.3
+      - Class: rviz_default_plugins/Orbit
+        Distance: 420.0
+        Focal Point:
+          X: 0.0
+          Y: 0.0
+          Z: 0.0
+        Focal Shape Fixed Size: true
+        Focal Shape Size: 0.05
+        Invert Z Axis: false
+        Name: 4 Full Theatre
+        Near Clip Distance: 0.1
+        Pitch: 0.95
+        Target Frame: world
+        Yaw: 0.785
+      - Class: rviz_default_plugins/FPS
+        Name: 5 Free Flight (FPS)
+        Near Clip Distance: 0.1
+        Pitch: 0.0
+        Position:
+          X: -120.0
+          Y: -60.0
+          Z: 35.0
+        Target Frame: world
+        Yaw: 0.6
+Window Geometry:
+  Displays:
+    collapsed: false
+  Height: 1000
+  Hide Left Dock: false
+  Hide Right Dock: false
+  Selection:
+    collapsed: false
+  Tool Properties:
+    collapsed: false
+  Views:
+    collapsed: false
+  Width: 1760
+  X: 60
+  Y: 40

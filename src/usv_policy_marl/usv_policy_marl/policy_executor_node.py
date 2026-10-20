@@ -1,14 +1,24 @@
 """
 USV Swarm Simulation - ROS 2 Frozen FA-MAPPO Policy Executor Node
 Author: Principal Enterprise Engineer
-Stage: 2 (ROS 2 Modular Deployment)
+Stage: 2 (ROS 2 Modular Deployment, Multi-Target Battle)
 
 Responsibilities:
-- Subscribes to local target belief, health belief h_i(t), assigned role, and odometry
-- Assembles 35-dimensional local observation vector matching training specification
-- Evaluates frozen FA-MAPPO neural network policy (weights from fa_mappo_actor.npz/.pt)
-- Logs fleet convergence during spawn -> approach phase
+- Subscribes to per-hostile target beliefs, health belief h_i(t), assigned role + wing, odometry
+- Assembles the 35-dimensional local observation vector matching the training specification
+- Evaluates the frozen FA-MAPPO neural network policy (fa_mappo_actor.npz/.pt)
+- Flies the analytic tactical guidance laws from guidance.py (proportional navigation for
+  interceptors, Lyapunov standoff-orbit fields for containment trackers)
+- Blends MARL and analytic guidance by engagement phase, and logs that split so the division
+  of labour between the learned policy and the geometric controller is observable
 - Emits /usv_{i}/cmd_vel_nominal for the CBF safety shield to filter
+
+How MAPPO and the Hungarian allocator work together:
+  the allocator (usv_recovery_planner) decides WHICH hostile each vessel is committed to and
+  WHICH station it must hold; FA-MAPPO and the guidance laws decide HOW the vessel flies there.
+  The learned policy is given most authority where it was trained -- holding formation on the
+  containment ring -- and none at all on the terminal strike leg, which is safety-critical and
+  is owned by deterministic proportional navigation.
 """
 
 from __future__ import annotations
@@ -21,24 +31,64 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
+from std_msgs.msg import Float32
 from usv_msgs.msg import TargetBelief, USVHealth, RoleAssignment
+
+from usv_policy_marl.guidance import (
+    MAX_SURGE,
+    MAX_YAW_RATE,
+    GuidancePhase,
+    facing_factor,
+    heading_rate_cmd,
+    lead_station,
+    proportional_navigation,
+    select_phase,
+    speed_profile,
+    standoff_orbit_command,
+    transit_waypoint,
+    wrap_angle,
+)
+
+# Authority granted to the frozen FA-MAPPO actor, per engagement phase. The learned policy is
+# trusted where it was trained (formation holding) and excluded from the terminal strike leg.
+MARL_AUTHORITY: Dict[GuidancePhase, float] = {
+    GuidancePhase.LAUNCH: 0.10,
+    GuidancePhase.TRANSIT: 0.15,
+    GuidancePhase.DEPLOY: 0.30,
+    GuidancePhase.SHADOW: 0.45,
+    GuidancePhase.PINCER: 0.35,
+    GuidancePhase.TERMINAL: 0.00,
+    GuidancePhase.EMP_LOCK: 0.00,
+    GuidancePhase.ARREST_GUARD: 0.25,
+    GuidancePhase.RECOVERY: 0.00,
+    GuidancePhase.COMBAT_LOSS: 0.00,
+}
+
+# All containment trackers orbit the same way. Counter-rotating traffic on a shared ring is a
+# standing collision hazard, so circulation is uniform and station error is trimmed with speed.
+RING_CIRCULATION = 1.0
 
 
 class USVPolicyExecutorNode(Node):
-    """ROS 2 Node executing the frozen FA-MAPPO policy across the fleet."""
+    """ROS 2 Node executing the frozen FA-MAPPO policy and tactical guidance across the fleet."""
 
     ROLE_MAP = {"tracker": 0, "interceptor": 1, "relay": 2, "scout": 3}
 
     def __init__(self):
         super().__init__('usv_policy_executor_node')
 
-        self.declare_parameter('num_agents', 6)
+        self.declare_parameter('num_agents', 12)
+        self.declare_parameter('num_targets', 3)
         self.declare_parameter('model_path', '')
 
         self.num_agents = self.get_parameter('num_agents').get_parameter_value().integer_value
+        self.num_targets = max(1, self.get_parameter('num_targets').get_parameter_value().integer_value)
         model_path = self.get_parameter('model_path').get_parameter_value().string_value
 
-        self.get_logger().info(f"Initializing USVPolicyExecutorNode for {self.num_agents} vessels.")
+        self.get_logger().info(
+            f"Initializing USVPolicyExecutorNode for {self.num_agents} vessels "
+            f"across {self.num_targets} hostile wings."
+        )
 
         # Locate and load frozen FA-MAPPO policy weights
         self.policy_weights: Optional[Dict[str, np.ndarray]] = None
@@ -58,55 +108,59 @@ class USVPolicyExecutorNode(Node):
                     self.get_logger().warning(f"Could not load checkpoint from {c}: {e}")
 
         if self.policy_weights is None:
-            self.get_logger().warning("No FA-MAPPO checkpoint loaded; operating in proportional guidance mode.")
+            self.get_logger().warning("No FA-MAPPO checkpoint loaded; operating in analytic guidance mode.")
 
         # State caches
         self.usv_poses: Dict[int, Tuple[float, float, float, float, float, float]] = {}
-        self.target_beliefs: Dict[int, Tuple[float, float, float, float]] = {}
+        self.target_beliefs: Dict[Tuple[int, int], Tuple[float, float, float, float]] = {}
         self.health_beliefs: Dict[int, float] = {i: 1.0 for i in range(self.num_agents)}
         self.assigned_roles: Dict[int, str] = {i: "tracker" for i in range(self.num_agents)}
+        self.assigned_wings: Dict[int, int] = {i: 0 for i in range(self.num_agents)}
         self.target_slots: Dict[int, Tuple[float, float]] = {}
+        self.allocation_costs: Dict[int, float] = {i: 0.0 for i in range(self.num_agents)}
+        self.degraded_flags: Dict[int, bool] = {i: False for i in range(self.num_agents)}
+        self.defusal_progress: Dict[int, float] = {m: 0.0 for m in range(self.num_targets)}
 
-        # Telemetry & approach logging
+        # Telemetry
         self.sim_step_count = 0
+        self.phases: Dict[int, GuidancePhase] = {i: GuidancePhase.LAUNCH for i in range(self.num_agents)}
+        self.marl_authority: Dict[int, float] = {i: 0.0 for i in range(self.num_agents)}
 
         # Publishers & Subscriptions
         self.cmd_nominal_pubs: Dict[int, rclpy.publisher.Publisher] = {}
         self.odom_subs: Dict[int, rclpy.subscription.Subscription] = {}
-        self.belief_subs: Dict[int, rclpy.subscription.Subscription] = {}
+        self.belief_subs: Dict[Tuple[int, int], rclpy.subscription.Subscription] = {}
         self.health_subs: Dict[int, rclpy.subscription.Subscription] = {}
         self.role_subs: Dict[int, rclpy.subscription.Subscription] = {}
 
         for i in range(self.num_agents):
             self.cmd_nominal_pubs[i] = self.create_publisher(Twist, f'/usv_{i}/cmd_vel_nominal', 10)
             self.odom_subs[i] = self.create_subscription(
-                Odometry,
-                f'/usv_{i}/odom',
-                self._make_odom_cb(i),
-                10
+                Odometry, f'/usv_{i}/odom', self._make_odom_cb(i), 10
             )
-            self.belief_subs[i] = self.create_subscription(
-                TargetBelief,
-                f'/usv_{i}/target_belief',
-                self._make_belief_cb(i),
-                10
-            )
+            for m in range(self.num_targets):
+                self.belief_subs[(i, m)] = self.create_subscription(
+                    TargetBelief, f'/usv_{i}/target_{m}/belief', self._make_belief_cb(i, m), 10
+                )
             self.health_subs[i] = self.create_subscription(
-                USVHealth,
-                f'/usv_{i}/health',
-                self._make_health_cb(i),
-                10
+                USVHealth, f'/usv_{i}/health', self._make_health_cb(i), 10
             )
             self.role_subs[i] = self.create_subscription(
-                RoleAssignment,
-                f'/usv_{i}/role',
-                self._make_role_cb(i),
-                10
+                RoleAssignment, f'/usv_{i}/role', self._make_role_cb(i), 10
+            )
+
+        self.defuse_subs: Dict[int, rclpy.subscription.Subscription] = {}
+        for m in range(self.num_targets):
+            self.defuse_subs[m] = self.create_subscription(
+                Float32, f'/target_{m}/defuse_status', self._make_defuse_cb(m), 10
             )
 
         # 10 Hz Policy Inference Loop
         self.timer = self.create_timer(0.1, self._policy_step)
 
+    # ------------------------------------------------------------------
+    # Subscriptions
+    # ------------------------------------------------------------------
     def _make_odom_cb(self, agent_id: int):
         def callback(msg: Odometry):
             x = msg.pose.pose.position.x
@@ -120,14 +174,16 @@ class USVPolicyExecutorNode(Node):
             self.usv_poses[agent_id] = (x, y, psi, u, v, r)
         return callback
 
-    def _make_belief_cb(self, agent_id: int):
+    def _make_belief_cb(self, agent_id: int, target_id: int):
         def callback(msg: TargetBelief):
-            self.target_beliefs[agent_id] = (
-                msg.position.x,
-                msg.position.y,
-                msg.velocity.x,
-                msg.velocity.y
+            self.target_beliefs[(agent_id, target_id)] = (
+                msg.position.x, msg.position.y, msg.velocity.x, msg.velocity.y
             )
+        return callback
+
+    def _make_defuse_cb(self, target_id: int):
+        def callback(msg: Float32):
+            self.defusal_progress[target_id] = float(msg.data)
         return callback
 
     def _make_health_cb(self, agent_id: int):
@@ -138,9 +194,15 @@ class USVPolicyExecutorNode(Node):
     def _make_role_cb(self, agent_id: int):
         def callback(msg: RoleAssignment):
             self.assigned_roles[agent_id] = msg.role
+            self.assigned_wings[agent_id] = int(msg.assigned_target_id)
             self.target_slots[agent_id] = (msg.target_slot.x, msg.target_slot.y)
+            self.allocation_costs[agent_id] = float(msg.allocation_cost)
+            self.degraded_flags[agent_id] = bool(msg.is_degraded_reallocation)
         return callback
 
+    # ------------------------------------------------------------------
+    # Frozen FA-MAPPO actor
+    # ------------------------------------------------------------------
     def _forward_marl_policy(self, obs: np.ndarray) -> Tuple[float, float]:
         """Evaluates frozen 3-layer FA-MAPPO Actor with LayerNorm and Tanh activations."""
         w = self.policy_weights
@@ -159,186 +221,238 @@ class USVPolicyExecutorNode(Node):
         r_cmd = float(np.tanh(mean[1]) * 0.8)
         return u_cmd, r_cmd
 
+    def _assemble_observation(self, agent_id: int, belief: Tuple[float, float, float, float]) -> np.ndarray:
+        """
+        Builds the 35-dimensional observation exactly as specified during FA-MAPPO training.
+        The layout is frozen with the weights and must not be reordered.
+        """
+        x, y, psi, u, v, r = self.usv_poses[agent_id]
+        h_i = self.health_beliefs.get(agent_id, 1.0)
+        role = self.assigned_roles.get(agent_id, "tracker")
+
+        tx, ty, tvx, tvy = belief
+        dx_t = tx - x
+        dy_t = ty - y
+        dist_t = math.hypot(dx_t, dy_t)
+        bearing_t = wrap_angle(math.atan2(dy_t, dx_t) - psi)
+
+        fault_one_hot = [1.0, 0.0, 0.0, 0.0] if h_i >= 0.60 else [0.0, 0.0, 1.0, 0.0]
+        role_one_hot = [0.0, 0.0, 0.0, 0.0]
+        role_one_hot[self.ROLE_MAP.get(role.lower(), 3)] = 1.0
+
+        # 4 nearest neighbors
+        neighbors = []
+        for other_id in range(self.num_agents):
+            if other_id != agent_id and other_id in self.usv_poses:
+                ox, oy, _, _, _, _ = self.usv_poses[other_id]
+                ndist = math.hypot(ox - x, oy - y)
+                neighbors.append((ndist, (ox - x) / 50.0, (oy - y) / 50.0,
+                                  self.health_beliefs.get(other_id, 1.0)))
+        neighbors.sort(key=lambda item: item[0])
+        neighbor_features: List[float] = []
+        for k in range(4):
+            if k < len(neighbors):
+                ndist, ndx, ndy, nh = neighbors[k]
+                neighbor_features.extend([ndx, ndy, ndist / 50.0, nh])
+            else:
+                neighbor_features.extend([0.0, 0.0, 2.0, 0.0])
+
+        return np.array([
+            dx_t / 50.0, dy_t / 50.0, dist_t / 50.0, bearing_t / math.pi,
+            tvx / 2.0, tvy / 2.0,
+            u / 2.5, v / 1.0, r / 0.8, psi / math.pi,
+            h_i,
+            *fault_one_hot,
+            *role_one_hot,
+            *neighbor_features
+        ], dtype=np.float32)
+
+    # ------------------------------------------------------------------
+    # Policy loop
+    # ------------------------------------------------------------------
     def _policy_step(self):
         self.sim_step_count += 1
         t_sec = self.sim_step_count * 0.1
 
-        # Calculate mean approach distance across the fleet
-        dists_to_target = []
+        # Transit lane indices, assigned within each wing so a wing crosses open water abreast.
+        wing_members: Dict[int, List[int]] = {}
         for i in range(self.num_agents):
-            if i in self.usv_poses and i in self.target_beliefs:
-                ax, ay, _, _, _, _ = self.usv_poses[i]
-                tx, ty, _, _ = self.target_beliefs[i]
-                dists_to_target.append(math.hypot(ax - tx, ay - ty))
-
-        if dists_to_target:
-            mean_dist = float(np.mean(dists_to_target))
-            # Approach telemetry logged periodically throughout simulation
-            if self.sim_step_count % 15 == 0:
-                self.get_logger().info(
-                    f"[FA-MAPPO CONVERGENCE] t={t_sec:4.1f}s | Fleet Mean Distance: {mean_dist:5.1f}m -> 20m ring | "
-                    f"Active Policy: {'FA-MAPPO (fa_mappo_actor.npz)' if self.policy_weights else 'Proportional Guidance'}"
-                )
-
-        # Periodically log per-agent distinct geometric setpoints to verify plumbing
-        if self.sim_step_count % 20 == 0:
-            setpoints_str = " | ".join([
-                f"USV-{aid}({self.assigned_roles.get(aid, '?')}): ({self.target_slots.get(aid, (0.0, 0.0))[0]:.1f}, {self.target_slots.get(aid, (0.0, 0.0))[1]:.1f})"
-                for aid in range(self.num_agents)
-            ])
-            self.get_logger().info(f"[SETPOINTS] {setpoints_str}")
+            wing_members.setdefault(self.assigned_wings.get(i, 0), []).append(i)
+        lane_index = {
+            aid: idx
+            for members in wing_members.values()
+            for idx, aid in enumerate(sorted(members))
+        }
 
         for i in range(self.num_agents):
             if i not in self.usv_poses:
                 continue
 
             x, y, psi, u, v, r = self.usv_poses[i]
-            slot = self.target_slots.get(i)
-            role = self.assigned_roles.get(i, "tracker")
+            role = self.assigned_roles.get(i, "tracker").lower()
+            wing = self.assigned_wings.get(i, 0)
             h_i = self.health_beliefs.get(i, 1.0)
+            slot = self.target_slots.get(i)
 
-            # Target goal point: assigned slot (from Hungarian allocator) or target belief
-            if slot is not None:
-                gx, gy = slot
-            elif i in self.target_beliefs:
-                tx, ty, _, _ = self.target_beliefs[i]
-                gx, gy = tx, ty
+            belief = self.target_beliefs.get((i, wing))
+            if belief is None:
+                belief = self.target_beliefs.get((i, 0))
+            if belief is None:
+                # No track yet: hold the last command rather than guessing a goal.
+                continue
+
+            tx, ty, tvx, tvy = belief
+            if slot is None:
+                slot = (tx, ty)
+
+            d_station = math.hypot(slot[0] - x, slot[1] - y)
+            d_target = math.hypot(tx - x, ty - y)
+            target_speed = math.hypot(tvx, tvy)
+
+            # Ring geometry is recovered from the published station, so no extra plumbing is
+            # needed to know what radius and phase the allocator intends.
+            ring_radius = math.hypot(slot[0] - tx, slot[1] - ty)
+            station_bearing = math.atan2(slot[1] - ty, slot[0] - tx)
+
+            is_interceptor = "interceptor" in role
+            is_tracker = "tracker" in role
+            slot_kind = "stern" if is_interceptor else ("ring" if is_tracker else "station")
+            pincer_active = is_tracker and ring_radius < 18.0
+
+            defusal = self.defusal_progress.get(wing, 0.0)
+            phase = select_phase(
+                role=role,
+                slot_kind=slot_kind,
+                health=h_i,
+                dist_to_station=d_station,
+                dist_to_target=d_target,
+                mission_elapsed=t_sec,
+                pincer_active=pincer_active,
+                defusal_progress=defusal,
+                target_neutralized=(defusal >= 100.0),
+                is_casualty_station=(h_i < 0.25),
+            )
+            self.phases[i] = phase
+
+            # ---------------- Analytic tactical guidance ----------------
+            if phase is GuidancePhase.COMBAT_LOSS:
+                u_geo, r_geo, heading_err = 0.0, 0.0, 0.0
+
+            elif is_interceptor and phase in (GuidancePhase.TERMINAL, GuidancePhase.EMP_LOCK):
+                # Proportional navigation onto the lead point: a true collision course.
+                pn = proportional_navigation(
+                    own_pos=(x, y), own_psi=psi, own_speed=max(u, 0.5),
+                    target_pos=(tx, ty), target_vel=(tvx, tvy),
+                )
+                heading_err = wrap_angle(pn.desired_heading - psi)
+                r_geo = pn.yaw_rate_cmd
+                u_geo = speed_profile(phase, d_station, target_speed, health=h_i)
+
+            elif is_tracker and phase in (GuidancePhase.SHADOW, GuidancePhase.PINCER,
+                                          GuidancePhase.DEPLOY, GuidancePhase.ARREST_GUARD):
+                # Lyapunov standoff-orbit field with the hostile's own velocity as feed-forward,
+                # phase-locked onto the assigned ring station. Without the feed-forward term the
+                # ring translates out from under the tracker and containment never closes.
+                orbit_speed = 1.3 if phase is not GuidancePhase.PINCER else 1.75
+                sol = standoff_orbit_command(
+                    own_pos=(x, y), center=(tx, ty), center_vel=(tvx, tvy),
+                    radius=max(ring_radius, 1.0), station_bearing=station_bearing,
+                    circulation=RING_CIRCULATION, orbit_speed=orbit_speed,
+                )
+                heading_err = wrap_angle(sol.desired_heading - psi)
+                r_geo = heading_rate_cmd(heading_err)
+                u_geo = sol.desired_speed
+
             else:
-                gx, gy = x, y
+                # Transit, deployment and support stationkeeping. The station is projected
+                # forward along the hostile's velocity first: chasing where the station is now
+                # is a stern chase that strings the fleet out on one bearing and never closes
+                # the encirclement.
+                aim = lead_station((x, y), slot, (tvx, tvy))
+                if phase in (GuidancePhase.LAUNCH, GuidancePhase.TRANSIT):
+                    aim = transit_waypoint(
+                        (x, y), aim,
+                        lane_index=lane_index.get(i, 0),
+                        lane_count=max(1, len(wing_members.get(wing, [i]))),
+                    )
+                heading_err = wrap_angle(math.atan2(aim[1] - y, aim[0] - x) - psi)
+                r_geo = heading_rate_cmd(heading_err)
+                u_geo = speed_profile(phase, d_station, target_speed, health=h_i)
 
-            dx = gx - x
-            dy = gy - y
+            u_geo *= facing_factor(heading_err)
 
-            # Circumferential perimeter navigation: prevent non-interceptors from cutting across target core
-            is_interceptor = "interceptor" in role.lower()
-            if i in self.target_beliefs:
-                tx, ty, _, _ = self.target_beliefs[i]
-                d_to_tgt = math.hypot(x - tx, y - ty)
-                d_goal_to_tgt = math.hypot(gx - tx, gy - ty)
+            # ---------------- FA-MAPPO blend ----------------
+            authority = MARL_AUTHORITY.get(phase, 0.0)
+            if self.policy_weights is None:
+                authority = 0.0
+            self.marl_authority[i] = authority
 
-                if not is_interceptor:
-                    # Check if path crosses through target inner perimeter
-                    theta_agent = math.atan2(y - ty, x - tx)
-                    theta_goal = math.atan2(gy - ty, gx - tx)
-                    ang_diff = (theta_goal - theta_agent + math.pi) % (2.0 * math.pi) - math.pi
-
-                    if abs(ang_diff) > (math.pi / 3.0) and d_to_tgt < 26.0 and d_goal_to_tgt < 26.0:
-                        # Steer along circle circumference towards goal
-                        steer_dir = 1.0 if ang_diff > 0 else -1.0
-                        tangent_ang = theta_agent + steer_dir * (math.pi / 2.0)
-                        wp_x = tx + 20.0 * math.cos(tangent_ang)
-                        wp_y = ty + 20.0 * math.sin(tangent_ang)
-                        dx = wp_x - x
-                        dy = wp_y - y
-                    elif d_to_tgt < 16.0:
-                        # Radial push outward if non-interceptor drifts closer than 16m
-                        rad_push = (16.0 - d_to_tgt) * 2.5
-                        dx += math.cos(theta_agent) * rad_push
-                        dy += math.sin(theta_agent) * rad_push
-
-            dist = math.hypot(dx, dy)
-            target_heading = math.atan2(dy, dx)
-            heading_err = (target_heading - psi + math.pi) % (2 * math.pi) - math.pi
-
-            # High-responsiveness pursuit profile
-            is_degraded = h_i < 0.55
-            facing_factor = max(0.2, math.cos(heading_err))
-
-            if is_degraded:
-                # Safe transit velocity for degraded vessel peeling off to outer standoff
-                speed_des = max(0.4, 1.0 * (h_i / 0.55)) * facing_factor
-            elif is_interceptor:
-                # Interceptor combat strike sprint: aggressive sprint to capture corridor
-                if dist > 8.0:
-                    speed_des = 3.5 * facing_factor
-                elif dist > 2.0:
-                    speed_des = (1.4 + 2.1 * (dist / 8.0)) * facing_factor
-                else:
-                    speed_des = max(0.4, 1.4 * (dist / 2.0))
-            elif dist > 12.0:
-                # Fast intercept sprint to close standoff rapidly
-                speed_des = 3.2 * facing_factor
-            elif dist > 3.0:
-                # Smooth quadratic decel into orbit matching target velocity (~1.2 - 1.4 m/s)
-                alpha = (dist - 3.0) / 9.0
-                speed_des = (1.3 + 1.9 * (alpha ** 1.5)) * facing_factor
+            if authority > 0.0:
+                marl_u, marl_r = self._forward_marl_policy(
+                    self._assemble_observation(i, belief)
+                )
+                u_cmd = (1.0 - authority) * u_geo + authority * marl_u
+                r_cmd = (1.0 - authority) * r_geo + authority * marl_r
             else:
-                # Precision slot stationkeeping
-                speed_des = max(0.1, 1.3 * (dist / 3.0))
+                u_cmd, r_cmd = u_geo, r_geo
 
-            slot_r = float(np.clip(heading_err * 2.2, -0.8, 0.8))
+            u_cmd = float(np.clip(u_cmd, 0.0, MAX_SURGE))
+            r_cmd = float(np.clip(r_cmd, -MAX_YAW_RATE, MAX_YAW_RATE))
 
-            if self.policy_weights is not None:
-                # Assemble 35-dimensional FA-MAPPO observation vector
-                tx, ty, tvx, tvy = self.target_beliefs.get(i, (gx, gy, 0.0, 0.0))
-                dx_t = tx - x
-                dy_t = ty - y
-                dist_t = math.hypot(dx_t, dy_t)
-                bearing_t = (math.atan2(dy_t, dx_t) - psi + math.pi) % (2 * math.pi) - math.pi
-
-                fault_one_hot = [1.0, 0.0, 0.0, 0.0] if h_i >= 0.60 else [0.0, 0.0, 1.0, 0.0]
-                role_one_hot = [0.0, 0.0, 0.0, 0.0]
-                role_one_hot[self.ROLE_MAP.get(role.lower(), 3)] = 1.0
-
-                # 4 nearest neighbors
-                neighbors = []
-                for other_id in range(self.num_agents):
-                    if other_id != i and other_id in self.usv_poses:
-                        ox, oy, _, _, _, _ = self.usv_poses[other_id]
-                        ndist = math.hypot(ox - x, oy - y)
-                        neighbors.append((ndist, (ox - x) / 50.0, (oy - y) / 50.0, self.health_beliefs.get(other_id, 1.0)))
-                neighbors.sort(key=lambda item: item[0])
-                neighbor_features = []
-                for k in range(4):
-                    if k < len(neighbors):
-                        ndist, ndx, ndy, nh = neighbors[k]
-                        neighbor_features.extend([ndx, ndy, ndist / 50.0, nh])
-                    else:
-                        neighbor_features.extend([0.0, 0.0, 2.0, 0.0])
-
-                obs = np.array([
-                    dx_t / 50.0, dy_t / 50.0, dist_t / 50.0, bearing_t / math.pi,
-                    tvx / 2.0, tvy / 2.0,
-                    u / 2.5, v / 1.0, r / 0.8, psi / math.pi,
-                    h_i,
-                    *fault_one_hot,
-                    *role_one_hot,
-                    *neighbor_features
-                ], dtype=np.float32)
-
-                marl_u, marl_r = self._forward_marl_policy(obs)
-
-                # Decoupled transit vs. formation blending
-                if is_interceptor:
-                    # Interceptor executes targeted terminal pursuit
-                    u_cmd = float(speed_des)
-                    r_cmd = float(np.clip(heading_err * 2.4, -0.8, 0.8))
-                elif dist > 6.0:
-                    # Standoff transit phase: prioritize rapid slot intercept
-                    u_cmd = float(0.85 * speed_des + 0.15 * marl_u)
-                    r_cmd = float(np.clip(0.85 * slot_r + 0.15 * marl_r, -0.8, 0.8))
-                elif dist > 1.5:
-                    # Encirclement capture zone: blend MARL formation holding with slot guidance
-                    blend = (dist - 1.5) / 4.5
-                    u_cmd = float(blend * (0.6 * speed_des + 0.4 * marl_u) + (1.0 - blend) * max(0.2, 0.8 * dist))
-                    r_cmd = float(np.clip(0.6 * slot_r + 0.4 * marl_r, -0.8, 0.8))
-                else:
-                    # Close stationkeeping in slot
-                    u_cmd = float(max(0.0, 0.6 * dist))
-                    r_cmd = float(np.clip(heading_err * 1.2, -0.5, 0.5))
-            else:
-                # Proportional guidance fallback
-                u_cmd = float(speed_des)
-                r_cmd = slot_r
-
-            if is_degraded:
+            if phase is GuidancePhase.RECOVERY:
                 u_cmd = min(u_cmd, 1.0)
+            elif phase is GuidancePhase.COMBAT_LOSS:
+                u_cmd, r_cmd = 0.0, 0.0
 
-            # Publish nominal command
             cmd = Twist()
-            cmd.linear.x = float(u_cmd)
-            cmd.angular.z = float(r_cmd)
+            cmd.linear.x = u_cmd
+            cmd.angular.z = r_cmd
             self.cmd_nominal_pubs[i].publish(cmd)
+
+        self._log_telemetry(t_sec)
+
+    def _log_telemetry(self, t_sec: float) -> None:
+        """Reports the MAPPO / analytic-guidance division of labour every 2.0 s."""
+        if self.sim_step_count % 20 != 0:
+            return
+
+        dists = []
+        for i in range(self.num_agents):
+            wing = self.assigned_wings.get(i, 0)
+            belief = self.target_beliefs.get((i, wing))
+            if i in self.usv_poses and belief is not None:
+                dists.append(math.hypot(self.usv_poses[i][0] - belief[0],
+                                        self.usv_poses[i][1] - belief[1]))
+        mean_dist = float(np.mean(dists)) if dists else 0.0
+        mean_authority = float(np.mean(list(self.marl_authority.values())))
+
+        rows = []
+        for i in range(self.num_agents):
+            phase = self.phases.get(i, GuidancePhase.LAUNCH)
+            auth = self.marl_authority.get(i, 0.0)
+            # The law actually flown depends on role as well as phase: only containment
+            # trackers fly the standoff-orbit field; relays and scouts hold a waypoint station.
+            role_i = self.assigned_roles.get(i, "").lower()
+            if "interceptor" in role_i and phase in (GuidancePhase.TERMINAL, GuidancePhase.EMP_LOCK):
+                law = "PN-LEAD"
+            elif "tracker" in role_i and phase in (GuidancePhase.SHADOW, GuidancePhase.PINCER,
+                                                   GuidancePhase.DEPLOY, GuidancePhase.ARREST_GUARD):
+                law = "ORBIT-FIELD"
+            else:
+                law = "WAYPOINT"
+            rows.append(
+                f"USV-{i:<2} {self.assigned_roles.get(i, '?')[:4].upper():<4} T{self.assigned_wings.get(i, 0)} "
+                f"{phase.value:<12} {law:<11} MAPPO {auth*100:3.0f}% "
+                f"cost {self.allocation_costs.get(i, 0.0):7.1f}"
+            )
+
+        self.get_logger().info(
+            f"\n[FA-MAPPO / GUIDANCE SPLIT] t={t_sec:6.1f}s | "
+            f"Policy: {'fa_mappo_actor.npz (frozen)' if self.policy_weights else 'analytic only'} | "
+            f"Fleet mean range to wing hostile: {mean_dist:5.1f}m | "
+            f"Mean MAPPO authority: {mean_authority*100:4.1f}%\n  "
+            + "\n  ".join(rows)
+        )
 
 
 def main(args=None):

@@ -28,10 +28,47 @@ export QT_SCREEN_SCALE_FACTORS=1
 export GDK_SCALE=1
 export GDK_DPI_SCALE=1
 
+# ==============================================================================
+# VIEW SELECTION
+# ==============================================================================
+# Usage: ./run_rviz.sh [full|baseline] [--fullscreen]
+#   full      (default) the full TritonSwarm architecture
+#   baseline  the ablated comparison swarm
+#
+# RViz opens WINDOWED by default. Fullscreen hides the Displays / Views docks and, under
+# XWayland, swallows the mouse drags the Orbit camera needs - which is why the camera could
+# not be moved before. Pass --fullscreen explicitly if you want it anyway (F11 toggles it
+# from inside RViz too).
+MODE="full"
+FULLSCREEN=""
+for arg in "$@"; do
+  case "$arg" in
+    full|baseline) MODE="$arg" ;;
+    --fullscreen|-f) FULLSCREEN="--fullscreen" ;;
+    *) echo "Unknown argument: $arg (expected: full | baseline | --fullscreen)"; exit 2 ;;
+  esac
+done
+
+CONFIG="$SCRIPT_DIR/src/usv_bringup/config/rviz2_swarm.rviz"
+if [ "$MODE" = "baseline" ]; then
+  CONFIG="$SCRIPT_DIR/src/usv_bringup/config/rviz2_baseline.rviz"
+fi
+
 echo "=========================================================="
 echo " Launching High-Fidelity 3D Swarm Visualizer (RViz2)"
-echo " Render Mode: XWayland GLX (FBO Acceleration, Flicker-Free)"
-echo " Display Config: 4K Display Scaled 1:1, Zero-Strobe"
+echo " Scenario config : $MODE"
+echo " Render Mode     : XWayland GLX (FBO Acceleration, Flicker-Free)"
+echo " Window          : ${FULLSCREEN:-windowed 1760x1000} (F11 toggles fullscreen)"
+echo "----------------------------------------------------------"
+echo " CAMERA CONTROLS (the 'Move Camera' tool is active by default)"
+echo "   Left-drag        : orbit / change viewing angle"
+echo "   Scroll wheel     : zoom in / out"
+echo "   Middle-drag      : pan the focal point"
+echo "   Right-drag       : zoom (drag up/down)"
+echo "   Shift + drag     : pan"
+echo "   Views panel      : pick a preset (Battle Overview, Tactical Plan View,"
+echo "                      Engagement Close-Up, Full Theatre, Free Flight)"
+echo "   'f' then click   : focus the camera on whatever you clicked"
 echo "=========================================================="
 
-exec rviz2 --fullscreen -d "$SCRIPT_DIR/src/usv_bringup/config/rviz2_swarm.rviz"
+exec rviz2 $FULLSCREEN -d "$CONFIG"

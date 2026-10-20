@@ -157,3 +157,393 @@ When an anomalous condition occurs (node degradation $h_i < 0.30$, severe link d
    }
    ```
 4. **Deterministic Fallback:** If internet connectivity is interrupted or API keys are absent, the system automatically falls back to an internal rule-based arbiter without crashing.
+
+---
+
+## 12. Multi-Target Battle Doctrine (Stage 2 Scale-Up)
+
+The single-target prototype was scaled to a **multi-hostile agentic drone battle**: $N = 12$ ally
+drones against $M = 3$ coordinated hostile drones. Four new rclpy-free modules carry the doctrine,
+so the algorithms are unit-testable independently of ROS 2:
+
+| Module | Package | Responsibility |
+|---|---|---|
+| `establishment.py` | `usv_recovery_planner` | Tactical establishment resolver, wing partitioning, slot lattice, Hungarian cost matrix |
+| `guidance.py` | `usv_policy_marl` | Proportional navigation, standoff-orbit command, engagement phase machine |
+| `barriers.py` | `usv_safety_shield` | Velocity-aware multi-target control barrier functions |
+| `hostile_ai.py` | `usv_sim_core` | Coordinated hostile evasion, escort formation, mutual support |
+
+### 12.1 The Role-Continuity Invariant
+
+**Claim.** While at least four combat-fit vessels survive, every canonical role
+(`interceptor`, `tracker`, `relay`, `scout`) is manned.
+
+In the prototype, slots were generated *from* the surviving role vector:
+
+$$\mathcal{S}_t = f(\mathbf{r}_{t-1}), \qquad \mathbf{r}_t = g(\mathcal{S}_t)$$
+
+This recursion is the defect. Destroying the only relay removed `relay` from
+$\mathbf{r}_{t-1}$, so $\mathcal{S}_t$ contained no relay slot, and no assignment could ever
+restore it. Role loss was therefore permanent.
+
+Slots are now generated from the **mission state** instead:
+
+$$\mathcal{S}_t = f\big(\mathcal{W}_t,\; |\mathcal{A}^{\text{fit}}_t|\big), \qquad
+\mathbf{r}_t = g(\mathcal{S}_t)$$
+
+where $\mathcal{W}_t$ is the live wing partition and $\mathcal{A}^{\text{fit}}_t$ the set of
+combat-fit vessels. Because the Hungarian solve is a **complete** bipartite matching over a
+square cost matrix $\mathbf{C} \in \mathbb{R}^{N \times N}$, every slot in $\mathcal{S}_t$ is
+filled by exactly one vessel. A role slot cannot disappear when its incumbent is destroyed, so
+the next solve necessarily backfills it.
+
+**Doctrinal fill order** (earlier demands are manned first under scarcity):
+
+1. One interceptor on the highest-threat hostile
+2. One tracker on the highest-threat hostile
+3. **One relay** — the mesh backbone
+4. **One scout** — wide-area early warning
+5. One interceptor per remaining live wing
+6. One tracker per remaining live wing
+7. Second and third tracker per live wing
+8. One arrest guard per neutralized hull
+9. Second relay, then second scout, then surplus trackers
+
+Role-class coverage deliberately outranks spreading force across hostiles: a swarm with no
+comms backbone cannot fight at all, whereas an under-engaged second hostile is still tracked
+through the mesh. $N=6, M=1$ resolves to `1 interceptor + 3 trackers + 1 relay + 1 scout`,
+identical to the prototype's hardcoded split, preserving Stage-1 reproducibility.
+
+**Fitness floors.** $h_{\min} = 0.70$ (interceptor), $0.55$ (tracker), $0.35$ (relay),
+$0.25$ (scout). The infeasibility barrier is hard *only while fit alternatives outnumber the
+quota*; under scarcity it degrades to a graded penalty, so the least-unfit survivor takes the
+role rather than leaving it vacant. Degraded manning is flagged, never silent. Vessels below
+$h = 0.25$ are combat losses: excluded from the establishment and routed to rear casualty
+stations, with asymmetric penalties ($10^6$ for a wreck holding a role, $10^4$ for a fit hull
+standing off) so the correct pairing is strictly optimal.
+
+### 12.2 Tactical Wings and Merge Hysteresis
+
+Hostiles are partitioned into wings by union-find. Two live hostiles share a wing when
+$\|\mathbf{p}_i - \mathbf{p}_j\| \le 25\,\text{m}$, releasing only beyond $32\,\text{m}$.
+The hysteresis prevents wing chatter, and the merge resolves a geometric deadlock: two
+overlapping $14\,\text{m}$ exclusion envelopes would otherwise trap trackers between hostiles.
+A merged wing widens its ring to $R + \tfrac{1}{2}\max_{i,j}\|\mathbf{p}_i - \mathbf{p}_j\|$.
+
+### 12.3 Guidance Laws
+
+**Interceptors — proportional navigation.** Lateral acceleration is commanded proportional to
+the line-of-sight rate,
+
+$$a_{\text{cmd}} = N_{pn} V_c \dot{\lambda}, \qquad
+\dot{\lambda} = \frac{\mathbf{r} \times \mathbf{v}}{\|\mathbf{r}\|^2}, \qquad
+V_c = -\frac{\mathbf{r} \cdot \mathbf{v}}{\|\mathbf{r}\|}$$
+
+with $N_{pn} = 3.0$, driving $\dot{\lambda} \to 0$: a true collision course onto the lead point
+$\mathbf{p}_T + \mathbf{v}_T t_{go}$. Unlike pure pursuit this *leads* a crossing hostile, so
+interceptor tracks visibly curve ahead of the target instead of tail-chasing.
+
+**Trackers — standoff orbit of a moving hostile.** The command is composed in the hostile's own
+frame and transformed back to the ground frame:
+
+$$\mathbf{v}_{\text{cmd}} =
+\underbrace{-k_r (d - R)\,\hat{\mathbf{r}}}_{\text{radial}} +
+\underbrace{k_a (\Delta\phi \cdot R)\,\hat{\mathbf{t}}}_{\text{phase}} +
+\underbrace{\mathbf{v}_T}_{\text{feed-forward}}$$
+
+with $k_r = 0.45$, $k_a = 0.30$. Two properties matter:
+
+- The **feed-forward** term $\mathbf{v}_T$ is essential. A pure orbit field describes motion
+  relative to the centre only, so without it the ring translates out from under the tracker and
+  containment never closes against a hostile making $1.9\,\text{m/s}$.
+- The **phase term is signed**. A vessel that has run ahead of its station is commanded
+  retrograde and drops back. A forward-only trim lets every vessel catch up but none fall back,
+  which piles the whole ring onto a single arc.
+
+Circulation is uniform across the ring; counter-rotating traffic on a shared ring is a standing
+collision hazard, so station error is trimmed with speed rather than direction.
+
+**Engagement phases.** `LAUNCH → TRANSIT → DEPLOY → SHADOW → PINCER → TERMINAL → EMP_LOCK →
+ARREST_GUARD`, with `RECOVERY` and `COMBAT_LOSS` branches. Damage outranks geometry, so a
+crippled hull peels off instead of pressing an attack it cannot complete.
+
+### 12.4 How MAPPO and the Hungarian Allocator Divide the Work
+
+The allocator decides **which** hostile each vessel is committed to and **which** station it
+holds; FA-MAPPO and the guidance laws decide **how** it flies there. Authority granted to the
+frozen actor is phase-dependent — highest where it was trained (formation holding), and **zero**
+on the safety-critical terminal strike leg, which deterministic PN owns outright:
+
+| Phase | MAPPO authority | Law flown |
+|---|---|---|
+| `LAUNCH` / `TRANSIT` | 10% / 15% | waypoint + lane deconfliction |
+| `DEPLOY` | 30% | waypoint / orbit field |
+| `SHADOW` | **45%** | standoff orbit field |
+| `PINCER` | 35% | standoff orbit field |
+| `TERMINAL` / `EMP_LOCK` | **0%** | proportional navigation |
+| `ARREST_GUARD` | 25% | standoff orbit field |
+| `RECOVERY` / `COMBAT_LOSS` | 0% | waypoint / all stop |
+
+The split is published live in the `[FA-MAPPO / GUIDANCE SPLIT]` telemetry block, alongside each
+vessel's Hungarian allocation cost, so the division of labour is observable rather than implied.
+
+### 12.5 Velocity-Aware Control Barrier Functions
+
+Each constraint $h(\mathbf{p}) = \|\mathbf{p}_i - \mathbf{p}_{\text{obs}}\| - d_{\text{barrier}}$
+is enforced through the class-$\mathcal{K}$ condition $\dot{h} + \lambda h \ge 0$, bounding the
+permitted closing rate and hence the commanded surge:
+
+$$u \cos\beta \;\le\; \lambda\,(d - d_{\text{barrier}})\,\sigma \;-\; \dot{d}_{\text{obs}}$$
+
+with $\lambda = 0.9$, obstacle share $\sigma = 0.5$ for symmetrically-braking allies and
+$\sigma = 1$ otherwise, and the barrier placed $0.5\,\text{m}$ outside $d_{\text{safe}}$ to
+absorb first-order actuator lag ($\tau \approx 0.5\,\text{s}$). This is strictly better than a
+position-only throttle in both directions:
+
+- it intervenes early enough on a fast closure that the invariant is never crossed;
+- it does **not** brake a vessel that is merely near an obstacle while opening or passing
+  tangentially, so the swarm threads past drifting wrecks instead of jamming behind them.
+
+**Barrier tiers.** Inter-ally $d \ge 4.0\,\text{m}$ (never relaxed, any role or phase);
+$14.0\,\text{m}$ exclusion envelope around *every* hostile for non-interceptors; a
+$4.2\,\text{m}$ capture corridor granted to an interceptor on its **assigned** hostile only,
+with a zero-thrust brake at $4.0\,\text{m}$. The pincer floor is $15.5\,\text{m}$ — deliberately
+outside the exclusion envelope, so guidance never commands trackers onto a station the shield
+forbids. A vessel already inside an envelope receives a composite tangential escape course at
+reduced-but-nonzero speed; zeroing thrust inside a moving hostile's envelope would leave it to
+be run down.
+
+### 12.6 Coordinated Hostile Behaviour
+
+Hostiles fight the encirclement as a group, not as individuals:
+
+- **Open-sector escape** — reads the bearings of every pursuer and drives the widest unguarded
+  sector of its own perimeter.
+- **Split evasion** — biases escape vectors away from live partners, forcing the swarm to divide.
+- **Escort formation** — escorts hold station $38\,\text{m}$ off the flagship's quarters
+  (deliberately outside the wing-merge radius, so the hostile formation does not merge its own
+  wings while unthreatened).
+- **Mutual support** — an unengaged hostile makes a relief run toward a partner under EMP lock.
+- **Breakout burst** — $1.95\,\text{m/s}$ sprint when a wide sector opens with pursuers still
+  beyond $22\,\text{m}$; choked to $1.15\,\text{m/s}$ when flanked inside $16\,\text{m}$.
+- **Propulsion damage** — EMP lock compounds with geometry: a hull both flanked and under lock
+  is slower than one suffering either alone, decaying to $0.00\,\text{m/s}$ at full arrest.
+
+### 12.7 Verified Results
+
+`ros2 launch usv_bringup swarm_simulation.launch.py` (defaults: $N=12$, $M=3$,
+`scenario:=role_attrition`), 170 s mission:
+
+| Criterion | Result |
+|---|---|
+| All hostiles defused & arrested | **3 / 3 at 0.00 m/s** |
+| Inter-ally collision invariant $d \ge 4.0\,\text{m}$ | **Held — worst 5.06 m** |
+| Role vacancies (any canonical role unmanned) | **0** |
+| Combat losses sustained | 3 of 12 (relay, scout, tracker — each backfilled) |
+| Role manning at mission end | INT 3/3, TRK 4/4, RLY 1/1, SCT 1/1 (all fit) |
+| Reallocation events | 103, event-driven only (0 during steady state) |
+
+The `role_attrition` scenario destroys whichever vessel *currently holds* each role, so the
+establishment must re-man it from the survivors — e.g. relay destroyed at $t=22\,\text{s}$,
+backfilled by a tracker within one planner tick, with the formation re-forming around the
+replacement.
+
+---
+
+## 13. Autonomous Damage Control (Self-Healing)
+
+Degradation in TritonSwarm is **transient, not cumulative**. Every fault the injector can
+produce -- including a total combat loss -- is survivable, and the recovered vessel is
+re-tasked back into the formation.
+
+### 13.1 Recovery Pipeline
+
+```
+ fault / combat loss  ->  adrift  ->  damage control  ->  re-enters establishment  ->  re-tasked
+   h -> 0.00                16 s        12 s Hermite ramp      h >= 0.25               on station
+   thrust -> 0.00                       h, thrust -> 1.00
+```
+
+1. **Loss.** The hull goes dead in the water ($h = 0$, thrust $= 0$). `usv_sim_core` zeroes its
+   propulsion, so it drifts; the allocator drops it from the establishment and routes it to a
+   rear casualty station.
+2. **Backfill (immediate).** Because slots come from the establishment rather than the
+   surviving role vector (§12.1), the vacated role is re-manned by the next Hungarian solve --
+   measured at **≤ 1.0 s** of sustained vacancy.
+3. **Damage control.** After `repair_delay` (16 s) the repair ramp begins, interpolating health
+   and thrust back to nominal over `repair_duration` (12 s) along a smooth Hermite profile
+   $\alpha_s = 3\alpha^2 - 2\alpha^3$, so thrust returns gradually rather than stepping.
+4. **Re-entry.** Crossing $h \ge 0.25$ puts the vessel back in the establishment. Since the
+   establishment signature includes the fit-vessel count, the watchdog re-resolves immediately
+   rather than waiting for its 1 Hz tick.
+5. **Re-promotion.** Crossing $h \ge 0.80$ raises a `HEALTHY_RESTORED` recovery event, and the
+   vessel becomes eligible for the full role taxonomy again.
+
+Verified live (`scenario:=role_attrition`):
+
+```
+t=22.0s  [COMBAT LOSS]              USV-0 [RELAY] destroyed, dead in the water
+t=22.1s  [REALLOC]                  USV-2 SCOUT -> RELAY (cost 29.6)      <- role re-manned
+t=38.0s  [DAMAGE CONTROL]           recovery of USV-0 begun after 16.0s adrift
+         ...                        h: 0.00 -> 0.04 -> 0.16 -> ... (UNDER REPAIR)
+t=50.0s  [DAMAGE CONTROL COMPLETE]  USV-0 restored to h=1.00, back in the fight
+```
+
+The fleet therefore finishes the mission at **12/12 operational** despite sustaining three
+combat losses, against a worst-case trough of 10/12. Set `self_healing:=false` to disable it
+and reproduce cumulative attrition (this is how the ablated baseline in §14 is run).
+
+### 13.2 Doctrine Corrections Found by Live Measurement
+
+Three design errors were only exposed by instrumented live runs, and each is now covered by a
+regression test:
+
+| Defect | Symptom | Correction |
+|---|---|---|
+| **Scissor bias** displaced the two flank ring stations inward to "seal the escape sector" | It opened a ~117° hole elsewhere on the ring; Section 5 criterion 2 failed for entire engagements | Removed. Even phasing minimises the maximum angular gap *by construction*, which is exactly what the criteria measure; the squeeze comes from collapsing the radius alone |
+| **Stations were chased, not led** | A ring station orbiting a moving hostile translates while the vessel transits toward it, so the fleet closed at only (own − hostile) speed and strung out on one bearing instead of encircling | `lead_station()` projects the station forward by the exact solution of the interception quadratic $(\lvert v\rvert^2 - s^2)t^2 + 2(\mathbf{R}\cdot\mathbf{v})t + \lvert\mathbf{R}\rvert^2 = 0$. Time to arrest fell from 96 s to 53 s |
+| **Strike released before containment** | The interceptor simply ran the hostile down alone; the encirclement the mission is specified around never formed, and the arrest masked it | The strike element now **stages at 22 m** until the wing's containment ring is established, judged over the containment element only so the strike cannot authorize itself. A wing below ring strength is released after 85 s under *explicitly degraded* containment rather than deadlocking |
+
+---
+
+## 14. Architecture Ablation Study (Comparative Simulation)
+
+`usv_comparative_eval` provides a **control condition**: the same fleet, the same hostiles, the
+same physics, the same fault schedule and the same win condition, with the TritonSwarm
+intelligence stack removed and replaced by one conventional swarm controller.
+
+```bash
+./run_baseline_sim.sh          # run the ablated baseline alone
+./run_rviz.sh baseline         # visualize it (crimson ocean grid, so the two are distinguishable)
+./run_comparison.sh 190 12 3   # run BOTH conditions headless and print the comparison
+```
+
+### 14.1 Ablations and the Failure Mode Each Produces
+
+| Ablation | Replaced by | Failure mode |
+|---|---|---|
+| `NO_ALLOCATOR` | static role table fixed at startup | `ROLE_VACANCY` — a role dies permanently with its holder |
+| `NO_WING_PARTITION` | independent greedy nearest-target | `FORCE_DOGPILE`, `ASSIGNMENT_THRASH` |
+| `NO_LEAD_GUIDANCE` | pure pursuit onto the last measured position | `TAIL_CHASE`, `CONTAINMENT_FAIL` |
+| `NO_CBF_GUARANTEE` | conventional boids separation (7 m, gain 1.8) | `COLLISION`, `HOSTILE_IMPACT`, `STALL` |
+| `NO_STATE_ESTIMATION` | raw noisy measurement, 25% dropout, no fusion | `TRACK_ERROR`, `TRACK_LOSS` |
+| `NO_FAULT_DIAGNOSIS` | health published but never consulted | `UNDETECTED_FAULT` |
+| `NO_DAMAGE_CONTROL` | `self_healing:=false` | `ATTRITION` |
+| `NO_DEADLOCK_ESCAPE` | no tangential escape, no repulsion budget | `STALL` |
+
+The baseline **keeps conventional boids separation on purpose**. The study compares a formal
+safety guarantee against a soft heuristic, not against nothing at all; an unprotected swarm
+would be a straw man. What the heuristic lacks is a closing-rate ($\dot h$) term and any
+worst-case bound, so it reduces hull strikes without ever preventing them.
+
+### 14.2 Impartial Scoring
+
+`scorecard_node` is launched by **both** stacks with identical thresholds, and reads only
+ground-truth kinematics, ground-truth health, published roles and published beliefs. Neither
+architecture can influence how it is judged. Containment is assessed purely geometrically --
+any tracker or interceptor inside the ring band counts regardless of what the stack *claims*
+it is assigned to -- so the baseline is penalised for poor results, never for poor bookkeeping.
+
+Two measurement traps were identified and corrected during validation:
+
+- **Arrest credit.** An arrested hull counts as contained, which rewards whoever disabled a
+  hostile earliest rather than whoever encircled better — and initially made the *baseline*
+  appear to out-encircle the full stack. Encirclement is therefore reported over **live
+  hostile-seconds only**, with the arrest-inclusive figure kept as informational.
+- **Path efficiency.** Orbiting a hostile is the correct behaviour and inherently lowers a
+  net-displacement/path-length ratio. That row is reported **without a verdict** rather than
+  scored as a loss.
+
+The decisive metric is **CLEAN non-destructive arrests**. The brief is a non-destructive
+arrest, so a hostile stopped by being rammed is disabled but *not* captured — and ramming is
+exactly what a swarm with no barrier function does, because nothing brakes it at the 4.0 m
+arrest boundary.
+
+### 14.3 Results — 12 drones vs 3 hostiles, 190 s, `role_attrition`
+
+| Metric | Full architecture | Ablated baseline | Verdict |
+|---|---|---|---|
+| **MISSION CLEAN** (all criteria) | **PASS** | FAIL | Full |
+| **CLEAN non-destructive arrests** | **3 / 3** | 0 / 3 | Full |
+| Hostiles disabled (incl. ramming) | 3 / 3 | 3 / 3 | tie |
+| Drone-on-hostile hull strikes | **0** | 3 | Full |
+| Closest approach to a hostile | 3.63 m | 2.83 m | Full |
+| Colliding drone pairs | **0** | 5 | Full |
+| Worst inter-drone separation | **4.32 m** | 2.50 m | Full |
+| Time below the 4.0 m invariant | **0.0 s** | 156.8 s | Full |
+| Longest **sustained** role vacancy | **1.0 s** | 160.1 s | 160× |
+| — relay unmanned | 1.0 s | 160.2 s | 160× |
+| — scout unmanned | 1.1 s | 142.2 s | 129× |
+| Hostile tracking RMSE | **2.70 m** | 18.31 m | 6.8× |
+| Assignment changes | **64.7 /min** | 184.2 /min | 2.8× |
+| Mean fleet availability | **97.3 %** | 29.4 % | 3.3× |
+| Drones operational at the end | **12 / 12** | 1 / 12 | 12× |
+
+At a second operating point (**12 drones vs 1 hostile**, where the fleet is large enough to
+ring the target) encirclement itself separates the two: **22.5 % of live hostile-time encircled
+versus 0.0 %**, with the strike released only on `containment ring established with 6 trackers,
+max gap 1.58 ≤ 1.68 rad`.
+
+### 14.4 Where the Baseline Wins, and Why That Is Not a Better Outcome
+
+The study is reported honestly, including the rows the baseline takes:
+
+- **Time to disable (26.5 s vs 108.1 s).** The baseline is faster because nothing brakes its
+  approach and nothing makes it wait for containment. It reaches the objective by ramming it,
+  loses drones to hull strikes, and leaves roles permanently unmanned. Against a
+  non-destructive arrest brief, arriving sooner this way is a mission failure, not a win.
+- **Transit directness (0.864 vs 0.521).** Flying straight at a target is direct; orbiting it
+  is not. Containment requires orbiting, so this row is informational.
+
+### 14.5 A Structural Limit, Stated Plainly
+
+At 12 drones against 3 hostiles, **neither** architecture sustains three simultaneous Section 5
+rings, and the metric correctly reports 0.0 % for both. Three rings need 3 trackers each plus
+3 interceptors — 12 vessels — leaving nothing for the relay backbone or the scout picket. The
+full architecture still wins the engagement by sequencing: wings re-task onto the live hostiles
+as each arrest completes. Simultaneous three-hostile containment needs a fleet of roughly
+15–18, and the establishment resolver scales to it without modification.
+
+---
+
+## 15. Formation Stability Corrections
+
+A second round of instrumented runs showed the fleet *visibly milling about* for the first
+~20 s of every mission and drones repeatedly turning around for a different hostile. Metrics
+alone had not caught it, because the mission still completed. Five causes, all now regression
+tested:
+
+| Cause | Mechanism | Correction |
+|---|---|---|
+| **Unbounded lead horizon** | `lead_station()` extrapolated hostile velocity up to 60 s. Hostiles weave on a ~3 s period and switch tactic every few seconds, so the aim point swung tens of metres per tick and no vessel ever settled on a transit course | Lead clamped to `T_MANEUVER_HORIZON = 8.0 s`. The exact intercept solution is still used, then bounded to the window over which the hostile's velocity is actually predictive |
+| **Hostiles spawned inside the wing merge band** | Escorts spawned 27.8 m from the flagship, between the 25 m merge and 32 m split radii, and station-kept at 38 m. The ally wings therefore merged and split repeatedly (3 → 2 → 1 → 2 → 3 wings) and *every* transition invalidated the station lattice and reshuffled the whole fleet | Formation spacing widened (`along 20 m`, `across 46 m`) and `R_ESCORT_STATION` raised to 52 m, so every hostile pair starts and stays outside the band |
+| **Hysteresis band too narrow** | A 25/32 m band turned ordinary weaving into merge/split chatter | Widened to **22 m merge / 40 m split** |
+| **Fixed wing-switch penalty** | A flat 45 (then 120) cost cannot work at every range: during the launch transit the fleet is bunched 85 m out with hostiles 90 m apart, so station distances to two wings differ by far more than any fixed cost and the assignment is nearly degenerate | Penalty is now `120 + 0.5 × distance` — scale-invariant, so a switch is only chosen when the other wing is dramatically closer. Still waived entirely once a hostile is neutralized, so force freed by an arrest re-tasks for free |
+| **Threat-ranked surplus force** | Wings were ordered by raw threat, and hostile speed legitimately swings between regimes (contested 1.15 → evade 1.65 → burst 1.95 m/s). The ranking flipped every few seconds, moving the surplus tracker slot between wings and making that drone shuttle for the whole engagement | Ordering is by `THREAT_BAND = 2.5 m/s` then strictly by wing id. The band is wider than the entire evasion envelope, so evasive swings cannot re-rank; a genuinely faster class of hostile still draws surplus force |
+
+Measured effect over a 90 s mission:
+
+| | Before | After |
+|---|---|---|
+| Wing partitions observed | 1, 2 and 3 (chattering) | **3 (stable)** |
+| Total wing changes | 35 | **14** |
+| Wing changes in the first 18 s | 11 | **2** |
+| Reallocation events | 70 | **50** |
+| Collision invariant breaches | 0 | **0** |
+
+The residual changes are event-driven: each cluster sits within ~2 s of a combat loss, a
+damage-control restoration, or an arrest freeing a wing — which is the allocator doing its job.
+
+### 15.1 Two Measurement Artifacts Corrected
+
+The scorer was also penalising correct behaviour:
+
+- **Stall threshold.** A stall was any immobile drone more than 12 m from its hostile, which
+  flagged the strike element correctly staging at 22 m, the relay on its 30 m backbone and the
+  scout on its 45 m picket. `STALL_RANGE` is now **55 m**, outside every doctrinal station, so
+  a flagged stall means genuinely stuck. A test now asserts that *every* station radius
+  (4.8 / 15.5 / 20 / 22 / 30 / 45 m) scores zero stall time.
+- **Stack identity.** Both stacks publish `/usv_swarm/markers`, so in RViz they were visually
+  indistinguishable and it was impossible to tell which one was on screen. `usv_sim_core` now
+  takes a `stack_label` parameter, set by each launch file, and prints it as the first line of
+  the battle HUD.

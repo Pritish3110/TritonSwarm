@@ -32,7 +32,7 @@ class USVDiagnosisNode(Node):
     def __init__(self):
         super().__init__('usv_diagnosis_node')
 
-        self.declare_parameter('num_agents', 6)
+        self.declare_parameter('num_agents', 12)
         self.declare_parameter('model_path', '')
         self.declare_parameter('window_size', 10)
 

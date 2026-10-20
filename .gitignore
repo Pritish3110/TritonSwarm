@@ -34,3 +34,6 @@ htmlcov/
 # Runtime Logs
 *.log
 Ogre.log
+
+# Architecture ablation study run artifacts (regenerate with ./run_comparison.sh)
+docs/comparison_runs/
