@@ -16,6 +16,22 @@ conda activate usv_swarm_env
 source /opt/ros/lyrical/setup.bash
 source "$SCRIPT_DIR/install/setup.bash"
 
+# ------------------------------------------------------------------------------
+# PRE-FLIGHT: refuse to start if simulation nodes are already running.
+# A surviving sim_core from an earlier run publishes onto the same topics as this
+# one, so two simulators fight over /target_{m}/odom and the run is silently
+# corrupted -- hostiles appear frozen at another run's final positions.
+# ------------------------------------------------------------------------------
+STALE="$(pgrep -f "install/usv_[a-z_]*/lib/usv_" || true)"
+if [ -n "$STALE" ]; then
+  echo "ERROR: simulation nodes from a previous run are still alive:" >&2
+  pgrep -af "install/usv_[a-z_]*/lib/usv_" >&2
+  echo >&2
+  echo "Clear them first, then re-run:" >&2
+  echo "  pkill -f 'install/usv_[a-z_]*/lib/usv_'" >&2
+  exit 1
+fi
+
 # Usage: ./run_stage2_sim.sh [num_agents] [target_mode] [num_targets] [scenario]
 #   scenario: role_attrition (default) | staggered_multi | single
 NUM_AGENTS=${1:-12}

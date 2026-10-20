@@ -613,3 +613,109 @@ honest result, already stated in §14.5: the fleet is below the strength needed 
 three-hostile containment. The architecture wins that engagement by sequencing wings onto each
 arrest, and the comparison remains decisive on clean arrests, hull strikes, collisions, role
 continuity, tracking accuracy and fleet survival.
+
+---
+
+## 17. Standing Garrisons: Dividing the Fleet Across Arrested Hulls
+
+Previously an arrested hull kept a single sentry and the rest of its wing re-tasked to the live
+fight. An arrested hull is now **garrisoned**: it keeps a complete sub-formation, and once every
+hostile is down the fleet has divided itself roughly equally between them, every role still
+doing its own job.
+
+### 17.1 Garrison Composition
+
+Each arrested hull holds:
+
+| Element | Station | Behaviour |
+|---|---|---|
+| Strike element (interceptor) | `R_GARRISON_ESCORT` = 9.5 m | circles the hull close in |
+| Containment element (trackers) | `R_ARREST_GUARD` = 15.5 m | evenly phased ring, circles the hull |
+
+The two rings are **counter-phased** (the escort sits opposite the first ring station) so they
+never stack up, and 9.5 m sits inside 15.5 m so the elements stay radially separated. Both rings
+**precess** at `GARRISON_SPIN_RATE = 0.10 rad/s`: the station each vessel holds sweeps around the
+hull, so the existing phase-lock guidance produces continuous circulation. Without that the
+garrison would converge on a fixed bearing and park, because a stationary hull supplies no
+velocity feed-forward to keep the orbit moving.
+
+Fleet-level roles are **not** garrison members, and are explicitly excluded:
+
+- **Relay** — bridges the dispersed garrisons. With several garrisons the backbone's job is no
+  longer to sit astern of one engagement box, so relays are stationed on the **chords between
+  hull positions**; a lone relay holds the most central station it can. Either way the station
+  is pushed clear of every hull by `clear_of_hulls()`, because with three collinear hostiles the
+  formation centroid *is* the middle hull's position and a relay placed there would be commanded
+  onto the hull and shoved off it by the safety shield for the rest of the mission.
+- **Scout** — screens the whole formation. The picket radius grows with how far apart the
+  garrisons are (`max(45, extent/2 + 25)`), so a dispersed fleet is not screened by a ring
+  sitting inside it.
+
+### 17.2 Equal Division, Without Abandoning the Live Fight
+
+Live wings and garrison wings are ordered into one demand list — **live first**, so a hostile
+still under way is never stripped of force to garrison an arrested one — and then filled by a
+single rule. Rings are built out in step, so force divides evenly across every hull the fleet is
+responsible for instead of one engagement absorbing all of it.
+
+The lead wing is completed before the fleet spreads out, which matters for the no-downtime
+invariant: giving every hull its strike element before any hull gets a tracker would leave the
+**tracker role unmanned** on a small fleet. A test now asserts every role stays manned in the
+fully-arrested state for every fleet size from 4 to 16.
+
+### 17.3 Verified Result — 12 drones, 3 hostiles, 175 s
+
+Garrisons forming as each arrest completes:
+
+```
+garrisons H1:3
+garrisons H1:3, H2:3
+garrisons H0:3, H1:3, H2:3
+garrisons H0:4, H1:3, H2:3      <- fleet divided 4/3/3
+```
+
+Final formation, all three hostiles arrested:
+
+| Hull | Strike element | Containment ring |
+|---|---|---|
+| H0 | USV-7 @ 9.6 m | USV-1, USV-9, USV-11 @ 16.2–16.6 m |
+| H1 | USV-8 @ 9.6 m | USV-5, USV-6 @ 16.3–16.5 m |
+| H2 | USV-4 @ 9.6 m | USV-0, USV-10 @ 16.2–16.8 m |
+
+plus **USV-3 RELAY** on the mesh backbone bridging all three garrisons, and **USV-2 SCOUT** on
+the wide-area picket screening the formation. Both fly `WAYPOINT` guidance, not the garrison
+orbit — they are keeping the formation connected and screened, not circling a hull.
+
+| | Result |
+|---|---|
+| Role manning | INT 3/3, TRK 7/7, RLY 1/1, SCT 1/1 — all fit |
+| Garrison division | 4 / 3 / 3 (equal within one vessel) |
+| Containment spread per hull | 3.96, 3.15, 3.16 rad — the garrisons genuinely encircle |
+| Ring precession | 260° at t=171 s — continuously circling |
+| Collision invariant | held, worst separation 4.53 m |
+| Fleet | 12/12 operational |
+
+### 17.4 A Measurement Fault Found Along the Way
+
+The first garrison run appeared to show all three hostiles **frozen at non-spawn positions with
+zero displacement**. The cause was not the simulation: a complete set of eight nodes from an
+earlier run was still alive. On SIGINT, rclpy tears the context down from its own signal handler,
+so `rclpy.spin()` raises `ExternalShutdownException` rather than `KeyboardInterrupt`; that was
+uncaught, and `rclpy.shutdown()` was then called on an already-dead context. Nodes survived the
+launch exiting, and a surviving `sim_core` published onto the same topics as the next run — two
+simulators fighting over `/target_{m}/odom`.
+
+Fixed in all nine nodes:
+
+```python
+except (KeyboardInterrupt, ExternalShutdownException):
+    pass
+finally:
+    node.destroy_node()
+    if rclpy.ok():
+        rclpy.shutdown()
+```
+
+`run_stage2_sim.sh`, `run_baseline_sim.sh` and `run_comparison.sh` now also refuse to start if
+simulation nodes are already running, naming the processes and the command to clear them, so a
+run can never be silently corrupted this way again.

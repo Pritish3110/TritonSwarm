@@ -42,10 +42,17 @@ from usv_recovery_planner.establishment import (  # noqa: E402
     TargetState,
     audit_manning,
     build_slot_lattice,
+    clear_of_hulls,
     group_wings,
     merged_pairs,
     pincer_ring_radius,
+    GARRISON_SPIN_RATE,
+    GARRISON_TRACKERS,
     R_ARREST_GUARD,
+    R_FLEET_STATION_STANDOFF,
+    R_GARRISON_ESCORT,
+    R_MESH_BACKBONE,
+    R_PICKET,
     WING_SPLIT_RADIUS,
     resolve_establishment,
     solve_assignment,
@@ -1475,3 +1482,290 @@ def test_wing_assignment_is_stable_during_the_launch_transit():
         )
         prev_keys = {aid: a.slot_key for aid, a in nxt.items()}
         prev_wing = {aid: a.target_id for aid, a in nxt.items()}
+
+
+# ---------------------------------------------------------------------------
+# 12. Standing garrisons on arrested hulls
+# ---------------------------------------------------------------------------
+def _garrison_totals(est):
+    return {w: est.garrison_total(w)
+            for w in sorted(set(est.guards) | set(est.garrison_interceptors))}
+
+
+def test_arrested_hull_gets_a_complete_garrison_not_a_lone_sentry():
+    """
+    An arrested hull is not released from the fleet's responsibility: it keeps a strike element
+    stationed on it and a tracker ring circling it, so every role carries on doing its job
+    while the hostile is down.
+    """
+    targets = _targets(3, neutralized=(1,))
+    wings = group_wings(targets)
+    est = resolve_establishment(12, wings)
+
+    assert est.garrison_interceptors.get(1, 0) >= 1, f"no strike element garrisoning H1: {est}"
+    assert est.guards.get(1, 0) >= 1, f"no tracker ring garrisoning H1: {est}"
+    assert est.garrison_total(1) >= 2
+
+    # The arrested hull is no longer part of the live fight.
+    assert 1 not in est.interceptors
+    assert 1 not in est.trackers
+    assert set(est.interceptors.keys()) == {0, 2}
+
+    # And every role class is still manned fleet-wide.
+    for role, count in est.role_totals().items():
+        assert count >= 1, f"role '{role}' unmanned: {est.role_totals()}"
+
+
+def test_fleet_divides_equally_once_every_hostile_is_arrested():
+    """
+    The headline requirement: with all hostiles down the fleet splits into balanced garrisons,
+    one per hull, rather than massing on one of them.
+    """
+    targets = _targets(3, neutralized=(0, 1, 2))
+    wings = group_wings(targets)
+    est = resolve_establishment(12, wings)
+
+    totals = _garrison_totals(est)
+    assert set(totals) == {0, 1, 2}, f"not every hull is garrisoned: {totals}"
+    assert max(totals.values()) - min(totals.values()) <= 1, (
+        f"garrisons are not equally divided: {totals}"
+    )
+    # Every garrison is a working sub-formation.
+    for wing_id in (0, 1, 2):
+        assert est.garrison_interceptors.get(wing_id, 0) >= 1
+        assert est.guards.get(wing_id, 0) >= 1
+    # Support roles are still manned so the dispersed formation stays coordinated.
+    assert est.relays >= 1
+    assert est.scouts >= 1
+    assert est.total == 12
+
+
+@pytest.mark.parametrize("num_agents", list(range(4, 17)))
+def test_no_role_goes_on_downtime_in_the_fully_arrested_state(num_agents):
+    """
+    The no-downtime invariant must survive the transition to garrison duty, not just the
+    live engagement.
+    """
+    targets = _targets(3, neutralized=(0, 1, 2))
+    est = resolve_establishment(num_agents, group_wings(targets))
+    for role, count in est.role_totals().items():
+        assert count >= 1, f"N={num_agents}: role '{role}' unmanned in garrison state: {est}"
+    assert est.total == num_agents
+
+
+def test_live_hostiles_keep_priority_over_garrisons():
+    """
+    A hostile still under way must not be stripped of force to garrison an arrested one.
+    """
+    targets = _targets(3, neutralized=(2,))
+    est = resolve_establishment(12, group_wings(targets))
+
+    for live in (0, 1):
+        assert est.interceptors.get(live, 0) >= 1, f"live hostile {live} unengaged: {est}"
+        assert est.trackers.get(live, 0) >= 1, f"live hostile {live} unshadowed: {est}"
+    assert est.unengaged_wings == ()
+    assert est.unshadowed_wings == ()
+
+
+def test_garrison_rings_precess_so_the_garrison_circles_the_hull():
+    """
+    The garrison must CIRCLE its hull, not park on a fixed bearing. The stations themselves
+    precess, so the existing phase-lock guidance produces continuous circulation.
+    """
+    targets = _targets(2, neutralized=(0,))
+    wings = group_wings(targets)
+    est = resolve_establishment(10, wings)
+
+    at_rest = build_slot_lattice(est, wings, garrison_spin=0.0)
+    spun = build_slot_lattice(est, wings, garrison_spin=0.8)
+
+    def guard_phases(slots):
+        return {s.key: s.phase_angle for s in slots if s.kind == "guard"}
+
+    a, b = guard_phases(at_rest), guard_phases(spun)
+    assert a and set(a) == set(b)
+    for key in a:
+        delta = abs(wrap_angle(b[key] - a[key]))
+        assert delta == pytest.approx(0.8, abs=1e-6), (
+            f"garrison station {key} did not precess: delta {delta:.3f}"
+        )
+
+    # Non-garrison stations must be unaffected by the garrison precession.
+    live_before = {s.key: s.phase_angle for s in at_rest if s.kind == "ring"}
+    live_after = {s.key: s.phase_angle for s in spun if s.kind == "ring"}
+    for key in live_before:
+        assert live_before[key] == pytest.approx(live_after[key], abs=1e-9)
+
+    assert GARRISON_SPIN_RATE > 0.0
+
+
+def test_garrison_strike_and_tracker_rings_do_not_stack_up():
+    """
+    The strike element sits closer in than the tracker ring and is counter-phased against it,
+    so the two rings stay clear of one another.
+    """
+    targets = _targets(1, neutralized=(0,))
+    wings = group_wings(targets)
+    est = resolve_establishment(8, wings)
+    slots = build_slot_lattice(est, wings)
+    centre = wings[0].center
+
+    escorts = [s for s in slots if s.kind == "guard" and s.role == ROLE_INTERCEPTOR]
+    ring = [s for s in slots if s.kind == "guard" and s.role == ROLE_TRACKER]
+    assert escorts and ring
+
+    for s in escorts:
+        d = math.hypot(s.point[0] - centre[0], s.point[1] - centre[1])
+        assert d == pytest.approx(R_GARRISON_ESCORT, abs=1e-6)
+    for s in ring:
+        d = math.hypot(s.point[0] - centre[0], s.point[1] - centre[1])
+        assert d == pytest.approx(R_ARREST_GUARD, abs=1e-6)
+
+    assert R_GARRISON_ESCORT < R_ARREST_GUARD
+    # Counter-phased: the escort does not sit on top of the first ring station.
+    assert abs(wrap_angle(escorts[0].phase_angle - ring[0].phase_angle)) > 1.0
+
+    # Every garrison station still clears the inter-ally invariant from its neighbours.
+    points = [s.point for s in escorts + ring]
+    for i in range(len(points)):
+        for j in range(i + 1, len(points)):
+            d = math.hypot(points[i][0] - points[j][0], points[i][1] - points[j][1])
+            assert d > D_SAFE_ALLY, f"garrison stations only {d:.2f} m apart"
+
+
+def test_relay_bridges_the_dispersed_garrisons():
+    """
+    With the fleet split across garrisons the backbone's job is to BRIDGE them. A lone relay
+    holds the most central station it can; several relays sit on the chords between hulls.
+    Either way the station must stand clear of every hull -- with three collinear hostiles the
+    formation centroid IS the middle one's position, and a relay placed there would be
+    commanded onto the hull and shoved away by the safety shield for the whole mission.
+    """
+    targets = _targets(3, spacing=120.0, neutralized=(0, 1, 2))
+    wings = group_wings(targets)
+    centres = [w.center for w in wings]
+    centroid = (sum(c[0] for c in centres) / 3.0, sum(c[1] for c in centres) / 3.0)
+
+    def clearance(point):
+        return min(math.hypot(point[0] - c[0], point[1] - c[1]) for c in centres)
+
+    # The centroid of a collinear formation lands exactly on the middle hull.
+    assert clearance(centroid) == pytest.approx(0.0, abs=1e-6)
+
+    # A single relay: central, but pushed clear of the hull it would otherwise sit on.
+    est_one = resolve_establishment(12, wings)
+    est_one.relays = 1
+    relay = next(s for s in build_slot_lattice(est_one, wings) if s.kind == "mesh")
+    assert clearance(relay.point) >= R_FLEET_STATION_STANDOFF - 1e-6, (
+        f"lone relay sits {clearance(relay.point):.1f} m from a hull"
+    )
+    # Still central enough to bridge: within one standoff of the true centroid.
+    assert math.hypot(relay.point[0] - centroid[0],
+                      relay.point[1] - centroid[1]) <= R_FLEET_STATION_STANDOFF + 1e-6
+
+    # Several relays: each bridging a pair of hulls, and all clear of every hull.
+    est_many = resolve_establishment(12, wings)
+    est_many.relays = 3
+    relays = [s for s in build_slot_lattice(est_many, wings) if s.kind == "mesh"]
+    assert len(relays) == 3
+    midpoints = [((centres[a][0] + centres[b][0]) / 2.0, (centres[a][1] + centres[b][1]) / 2.0)
+                 for a in range(3) for b in range(a + 1, 3)]
+    for s in relays:
+        assert clearance(s.point) >= R_FLEET_STATION_STANDOFF - 1e-6, (
+            f"relay at {s.point} is {clearance(s.point):.1f} m from a hull"
+        )
+        nearest_mid = min(math.hypot(s.point[0] - m[0], s.point[1] - m[1]) for m in midpoints)
+        assert nearest_mid <= R_FLEET_STATION_STANDOFF + 1e-6, (
+            f"relay at {s.point} is not bridging any pair of hulls (nearest chord "
+            f"midpoint {nearest_mid:.1f} m away)"
+        )
+
+
+def test_fleet_station_clearance_resolves_a_station_placed_on_a_hull():
+    """Directly exercises the clearance helper, including the exactly-coincident case."""
+    wings = group_wings(_targets(3, spacing=120.0, neutralized=(0, 1, 2)))
+    centres = [w.center for w in wings]
+
+    def clearance(point):
+        return min(math.hypot(point[0] - c[0], point[1] - c[1]) for c in centres)
+
+    # Exactly on a hull.
+    moved = clear_of_hulls(centres[1], wings)
+    assert clearance(moved) >= R_FLEET_STATION_STANDOFF - 1e-6
+
+    # Near a hull but not on it.
+    nudged = clear_of_hulls((centres[0][0] + 5.0, centres[0][1]), wings)
+    assert clearance(nudged) >= R_FLEET_STATION_STANDOFF - 1e-6
+
+    # Already clear: left exactly where it was.
+    far = (centres[0][0], centres[0][1] - 200.0)
+    assert clear_of_hulls(far, wings) == far
+
+    # No wings at all: returned unchanged rather than crashing.
+    assert clear_of_hulls((7.0, 9.0), []) == (7.0, 9.0)
+
+
+def test_scout_picket_grows_with_the_formation_extent():
+    """
+    A dispersed fleet must not be screened by a picket ring that sits inside it.
+    """
+    tight = group_wings(_targets(2, spacing=30.0, neutralized=(0, 1)))
+    spread = group_wings(_targets(2, spacing=240.0, neutralized=(0, 1)))
+
+    def picket_radius(wings):
+        est = resolve_establishment(12, wings)
+        est.scouts = 2
+        return max(s.ring_radius for s in build_slot_lattice(est, wings) if s.kind == "picket")
+
+    r_tight, r_spread = picket_radius(tight), picket_radius(spread)
+    assert r_tight >= R_PICKET
+    assert r_spread > r_tight + 50.0, (
+        f"picket did not grow with the formation: {r_tight:.0f} m -> {r_spread:.0f} m"
+    )
+
+
+def test_garrison_slots_publish_only_canonical_roles():
+    targets = _targets(3, neutralized=(0, 1, 2))
+    wings = group_wings(targets)
+    est = resolve_establishment(12, wings)
+    slots = build_slot_lattice(est, wings, garrison_spin=0.5)
+
+    assert len(slots) == 12
+    keys = [s.key for s in slots]
+    assert len(keys) == len(set(keys))
+    for s in slots:
+        assert s.role in CANONICAL_ROLES, f"non-canonical role {s.role} in {s.key}"
+        assert s.target_id in {0, 1, 2}
+
+
+def test_support_roles_are_never_garrison_members():
+    """
+    Relays and scouts hold fleet-level stations that span the whole formation -- the mesh
+    backbone and the wide-area picket. Neither is a garrison member, even when the hostile
+    they are nominally affiliated with has been arrested, or they would orbit a hull instead
+    of keeping the dispersed formation connected and screened.
+    """
+    targets = _targets(3, neutralized=(0, 1, 2))
+    wings = group_wings(targets)
+    est = resolve_establishment(12, wings)
+    slots = build_slot_lattice(est, wings, garrison_spin=0.4)
+
+    for s in slots:
+        if s.role in (ROLE_RELAY, ROLE_SCOUT):
+            assert s.kind != "guard", (
+                f"{s.role} slot {s.key} was built as a garrison station"
+            )
+        if s.kind == "guard":
+            assert s.role in (ROLE_INTERCEPTOR, ROLE_TRACKER), (
+                f"garrison slot {s.key} has non-combat role {s.role}"
+            )
+
+    # The support stations stand well outside any garrison ring, so they screen and bridge
+    # the formation rather than crowding a hull.
+    for s in slots:
+        if s.role in (ROLE_RELAY, ROLE_SCOUT):
+            for w in wings:
+                d = math.hypot(s.point[0] - w.center[0], s.point[1] - w.center[1])
+                assert d > R_ARREST_GUARD, (
+                    f"{s.role} station sits {d:.1f} m from hull {w.wing_id}, inside its garrison ring"
+                )

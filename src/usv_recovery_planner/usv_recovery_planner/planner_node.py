@@ -32,6 +32,7 @@ except ImportError:
 
 import rclpy
 from rclpy.node import Node
+from rclpy.executors import ExternalShutdownException
 from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy
 from nav_msgs.msg import Odometry
 from usv_msgs.msg import USVHealth, RoleAssignment, RecoveryEvent, MissionStatus
@@ -39,6 +40,7 @@ from std_msgs.msg import Float32
 
 from usv_recovery_planner.establishment import (
     CANONICAL_ROLES,
+    GARRISON_SPIN_RATE,
     CASUALTY_FLOOR,
     KIND_CASUALTY,
     KIND_GUARD,
@@ -127,6 +129,10 @@ class USVRecoveryPlannerNode(Node):
         self.defusal_progress: Dict[int, float] = {m: 0.0 for m in range(self.num_targets)}
         self.lock_announced: Dict[int, bool] = {m: False for m in range(self.num_targets)}
         self.pincer_progress: Dict[int, float] = {m: 0.0 for m in range(self.num_targets)}
+        # Precession angle of every garrison ring. Advancing it sweeps the station each
+        # garrison vessel holds around its arrested hull, so the garrison circles the hull
+        # instead of parking on a fixed bearing.
+        self.garrison_spin = 0.0
         self.debounce_timer: Dict[int, float] = {m: 0.0 for m in range(self.num_targets)}
         self.arrest_logged: Dict[int, bool] = {m: False for m in range(self.num_targets)}
         self.collision_occurred = False
@@ -380,13 +386,16 @@ class USVRecoveryPlannerNode(Node):
                 self.suppress_retention = True
             self._report_establishment(wings)
 
-        # 3. Walk the containment ring in for any wing whose interceptor has closed.
+        # 3. Walk the containment ring in for any wing whose interceptor has closed, and
+        #    advance the garrison precession.
         self._update_pincer(dt, wings)
+        self.garrison_spin = wrap_angle(self.garrison_spin + GARRISON_SPIN_RATE * dt)
 
         # 4. Build the slot lattice and solve the complete agent -> slot matching.
         collapse = {w.wing_id: max(self.pincer_progress.get(t, 0.0) for t in w.target_ids)
                     for w in wings}
-        slots = build_slot_lattice(self.establishment, wings, collapse_progress=collapse)
+        slots = build_slot_lattice(self.establishment, wings, collapse_progress=collapse,
+                                   garrison_spin=self.garrison_spin)
 
         if len(slots) != len(agent_ids):
             # Defensive: re-resolve against the current wings and rebuild immediately rather
@@ -397,7 +406,8 @@ class USVRecoveryPlannerNode(Node):
             self.establishment = resolve_establishment(
                 len(fit_ids), wings, num_casualties=len(agent_ids) - len(fit_ids)
             )
-            slots = build_slot_lattice(self.establishment, wings, collapse_progress=collapse)
+            slots = build_slot_lattice(self.establishment, wings, collapse_progress=collapse,
+                                       garrison_spin=self.garrison_spin)
             if len(slots) != len(agent_ids):
                 self.get_logger().error(
                     f"Slot lattice still {len(slots)} != fleet {len(agent_ids)}; skipping tick."
@@ -505,10 +515,15 @@ class USVRecoveryPlannerNode(Node):
         """Publishes and logs the current establishment and any manning shortfall."""
         est = self.establishment
         totals = est.role_totals()
+        garrisons = sorted(set(est.guards) | set(est.garrison_interceptors))
+        garrison_txt = (
+            " | garrisons " + ", ".join(f"H{g}:{est.garrison_total(g)}" for g in garrisons)
+            if garrisons else ""
+        )
         summary = (
             f"INT {totals[ROLE_INTERCEPTOR]} | TRK {totals[ROLE_TRACKER]} | "
             f"RLY {totals[ROLE_RELAY]} | SCT {totals[ROLE_SCOUT]} | "
-            f"casualties {est.casualty_stations} | wings {len(wings)}"
+            f"casualties {est.casualty_stations} | wings {len(wings)}{garrison_txt}"
         )
 
         if est.undermanned_roles:
@@ -822,7 +837,11 @@ class USVRecoveryPlannerNode(Node):
             elif h < 0.60:
                 state = "! DEGRADED / HEALING"
             elif kind == KIND_GUARD:
-                state = "ARREST GUARD 12m"
+                spin_deg = math.degrees(self.garrison_spin) % 360.0
+                if role == ROLE_INTERCEPTOR:
+                    state = f"GARRISON ESCORT 9.5m (ring {spin_deg:3.0f}deg)"
+                else:
+                    state = f"GARRISON RING 15.5m (ring {spin_deg:3.0f}deg)"
             elif role == ROLE_INTERCEPTOR:
                 pct = int(self.defusal_progress.get(wing, 0.0))
                 state = (f"EMP DEFUSAL {pct}%" if pct > 0 else
@@ -857,11 +876,17 @@ def main(args=None):
     node = USVRecoveryPlannerNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
+        # On SIGINT rclpy tears the context down from its own signal handler, so spin raises
+        # ExternalShutdownException rather than KeyboardInterrupt. Leaving that uncaught, and
+        # then calling shutdown() on an already-dead context, left nodes alive after the
+        # launch exited. A surviving sim_core then publishes onto the same topics as the next
+        # run, which silently corrupts it -- two simulators fighting over /target_{m}/odom.
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

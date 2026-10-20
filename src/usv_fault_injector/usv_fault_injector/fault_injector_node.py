@@ -28,6 +28,7 @@ import numpy as np
 
 import rclpy
 from rclpy.node import Node
+from rclpy.executors import ExternalShutdownException
 from std_msgs.msg import String
 from usv_msgs.msg import RoleAssignment, USVHealth
 
@@ -361,11 +362,17 @@ def main(args=None):
     node = USVFaultInjectorNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
+        # On SIGINT rclpy tears the context down from its own signal handler, so spin raises
+        # ExternalShutdownException rather than KeyboardInterrupt. Leaving that uncaught, and
+        # then calling shutdown() on an already-dead context, left nodes alive after the
+        # launch exited. A surviving sim_core then publishes onto the same topics as the next
+        # run, which silently corrupts it -- two simulators fighting over /target_{m}/odom.
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

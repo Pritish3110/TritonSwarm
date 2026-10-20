@@ -42,6 +42,10 @@ KIND_MESH = "mesh"            # relay comms backbone station
 KIND_PICKET = "picket"        # scout wide-area early warning station
 KIND_CASUALTY = "casualty"    # rear station for combat losses / dead-in-water hulls
 
+# Internal demand tags (never published as roles).
+DEMAND_GARRISON_INT = "garrison_interceptor"
+DEMAND_GARRISON_TRK = "garrison_tracker"
+
 # Minimum health a vessel needs to be trusted with each role.
 ROLE_FITNESS_FLOOR: Dict[str, float] = {
     ROLE_INTERCEPTOR: 0.70,   # needs full thrust for the 3.5 m/s terminal sprint
@@ -90,7 +94,17 @@ R_RING_BASE = 20.0
 R_RING_PINCER_FLOOR = 15.5   # just outside the shield's 14.0 m non-interceptor envelope
 R_STERN_CORRIDOR = 4.8
 R_ARREST_GUARD = 15.5
+R_GARRISON_ESCORT = 9.5      # strike element stationed close around an arrested hull
+
+# A garrison ring precesses about its arrested hull at this rate, so the station each vessel
+# is holding sweeps around the hull and the garrison visibly CIRCLES it instead of parking.
+GARRISON_SPIN_RATE = 0.10    # rad/s
+GARRISON_TRACKERS = 3        # ring trackers per arrested hull at full strength
 R_MESH_BACKBONE = 30.0
+# Minimum standoff any fleet-level station (mesh backbone, picket) keeps from a hostile hull.
+# A bridging relay placed at the formation centroid can otherwise land exactly on a hull --
+# with three collinear hostiles the centroid IS the middle one's position.
+R_FLEET_STATION_STANDOFF = 25.0
 R_PICKET = 45.0
 R_CASUALTY_STATION = 60.0
 
@@ -169,7 +183,8 @@ class Establishment:
     """The role quota the fleet must man this tick."""
     interceptors: Dict[int, int] = field(default_factory=dict)   # wing_id -> count
     trackers: Dict[int, int] = field(default_factory=dict)       # wing_id -> count
-    guards: Dict[int, int] = field(default_factory=dict)         # wing_id -> count (arrest guards)
+    guards: Dict[int, int] = field(default_factory=dict)         # wing_id -> garrison tracker count
+    garrison_interceptors: Dict[int, int] = field(default_factory=dict)  # wing_id -> count
     relays: int = 0
     scouts: int = 0
     casualty_stations: int = 0
@@ -184,17 +199,23 @@ class Establishment:
             sum(self.interceptors.values())
             + sum(self.trackers.values())
             + sum(self.guards.values())
+            + sum(self.garrison_interceptors.values())
             + self.relays
             + self.scouts
         )
 
     def role_totals(self) -> Dict[str, int]:
         return {
-            ROLE_INTERCEPTOR: sum(self.interceptors.values()),
+            ROLE_INTERCEPTOR: (sum(self.interceptors.values())
+                               + sum(self.garrison_interceptors.values())),
             ROLE_TRACKER: sum(self.trackers.values()) + sum(self.guards.values()),
             ROLE_RELAY: self.relays,
             ROLE_SCOUT: self.scouts,
         }
+
+    def garrison_total(self, wing_id: int) -> int:
+        """Vessels committed to garrisoning one arrested hull."""
+        return self.guards.get(wing_id, 0) + self.garrison_interceptors.get(wing_id, 0)
 
 
 @dataclass
@@ -336,57 +357,67 @@ def merged_pairs(wings: Sequence[Wing]) -> FrozenSet[FrozenSet[int]]:
 # ---------------------------------------------------------------------------
 def _demand_sequence(
     active_wing_ids: Sequence[int],
-    guard_wing_ids: Sequence[int],
+    garrison_wing_ids: Sequence[int],
 ) -> List[Tuple[str, Optional[int]]]:
     """
-    The doctrinal fill order. Earlier demands are manned first when the fleet is too small,
-    so scarcity degrades predictably instead of leaving a critical role class unmanned.
+    The doctrinal fill order. Earlier demands are manned first when the fleet is too small, so
+    scarcity degrades predictably instead of leaving a critical role class unmanned.
 
-    Role-class coverage outranks spreading force across hostiles: a swarm with no comms
-    backbone or no early warning cannot fight at all, whereas a second hostile that is merely
-    under-engaged is still shadowed by the mesh. That ordering is what makes "no role is ever
-    on downtime" hold for every fleet of four or more vessels, at any target count.
+    Live wings and garrison wings are ordered into one list -- live first, so a hostile still
+    under way is never stripped of force to garrison an arrested one -- and then filled with a
+    single rule. That matters for the no-downtime invariant: giving every hull its strike
+    element before any hull gets a tracker would leave the tracker role unmanned on a small
+    fleet, so the LEAD wing is completed first and the fleet-level roles come next.
 
-    P1  one interceptor on the highest-threat hostile
-    P2  one tracker on the highest-threat hostile
-    P3  one relay            - the mesh backbone keeps the swarm coordinated
+    P1  interceptor on the lead wing          (live if any hostile is still under way)
+    P2  tracker on the lead wing
+    P3  one relay            - the mesh backbone keeps the whole formation coordinated
     P4  one scout            - wide-area early warning is never blind
-    P5  one interceptor per remaining live wing
-    P6  one tracker per remaining live wing
-    P7  second and third tracker per live wing
-    P8  one arrest guard per neutralized hull
-    P9  second relay
-    P10 second scout
-    P11+ surplus trackers, highest-threat wing first
+    P5  interceptor per remaining wing
+    P6  tracker per remaining wing
+    P7  rings built out, every wing in step   (trackers 2 and 3 each)
+    P8  second relay         - bridges dispersed garrisons
+    P9  second scout
+    P10+ surplus trackers, round-robin across every wing, live and arrested alike
+
+    An ARRESTED hull is not released from the fleet's responsibility: it keeps its own standing
+    garrison -- a strike element stationed on it and a tracker ring circling it -- built out in
+    step with the live rings, so once every hostile is down the fleet has divided itself
+    roughly equally between them rather than massing in one place.
     """
+    # (wing_id, interceptor demand, tracker demand). Live wings lead.
+    wing_specs: List[Tuple[int, str, str]] = (
+        [(w, ROLE_INTERCEPTOR, ROLE_TRACKER) for w in active_wing_ids]
+        + [(w, DEMAND_GARRISON_INT, DEMAND_GARRISON_TRK) for w in garrison_wing_ids]
+    )
+
     demands: List[Tuple[str, Optional[int]]] = []
 
-    if active_wing_ids:
-        lead = active_wing_ids[0]
-        demands.append((ROLE_INTERCEPTOR, lead))
-        demands.append((ROLE_TRACKER, lead))
+    if wing_specs:
+        lead, lead_int, lead_trk = wing_specs[0]
+        demands.append((lead_int, lead))
+        demands.append((lead_trk, lead))
 
     demands.append((ROLE_RELAY, None))
     demands.append((ROLE_SCOUT, None))
 
-    for w in active_wing_ids[1:]:
-        demands.append((ROLE_INTERCEPTOR, w))
-    for w in active_wing_ids[1:]:
-        demands.append((ROLE_TRACKER, w))
+    for wing_id, int_demand, _ in wing_specs[1:]:
+        demands.append((int_demand, wing_id))
+    for wing_id, _, trk_demand in wing_specs[1:]:
+        demands.append((trk_demand, wing_id))
 
-    for _ in range(2):  # trackers 2 and 3 on every live wing
-        for w in active_wing_ids:
-            demands.append((ROLE_TRACKER, w))
-
-    for w in guard_wing_ids:
-        demands.append(("guard", w))
+    # Rings are built out in step so force divides evenly across every hull the fleet is
+    # responsible for, instead of one engagement absorbing all of it.
+    for _ in range(GARRISON_TRACKERS - 1):
+        for wing_id, _, trk_demand in wing_specs:
+            demands.append((trk_demand, wing_id))
 
     demands.append((ROLE_RELAY, None))
     demands.append((ROLE_SCOUT, None))
 
-    for _ in range(MAX_TRACKERS_PER_WING - 3):
-        for w in active_wing_ids:
-            demands.append((ROLE_TRACKER, w))
+    for _ in range(MAX_TRACKERS_PER_WING - GARRISON_TRACKERS):
+        for wing_id, _, trk_demand in wing_specs:
+            demands.append((trk_demand, wing_id))
 
     return demands
 
@@ -410,11 +441,9 @@ def resolve_establishment(
     )
     guards = sorted((w for w in wings if w.neutralized), key=lambda w: w.wing_id)
 
-    # With every hostile arrested, the ready reserve stations itself on the guarded hulls so
-    # the fleet still holds a complete establishment rather than standing down.
-    reference = active if active else guards
-
-    active_ids = [w.wing_id for w in reference]
+    # Arrested hulls are handled through the garrison demands rather than being promoted into
+    # the live-wing list, so the fleet keeps a complete establishment with every hostile down.
+    active_ids = [w.wing_id for w in active]
     guard_ids = [w.wing_id for w in guards]
 
     est = Establishment(casualty_stations=max(0, num_casualties))
@@ -435,8 +464,10 @@ def resolve_establishment(
             est.interceptors[wing_id] = est.interceptors.get(wing_id, 0) + 1
         elif role == ROLE_TRACKER:
             est.trackers[wing_id] = est.trackers.get(wing_id, 0) + 1
-        elif role == "guard":
+        elif role == DEMAND_GARRISON_TRK:
             est.guards[wing_id] = est.guards.get(wing_id, 0) + 1
+        elif role == DEMAND_GARRISON_INT:
+            est.garrison_interceptors[wing_id] = est.garrison_interceptors.get(wing_id, 0) + 1
         elif role == ROLE_RELAY:
             est.relays += 1
         else:
@@ -490,6 +521,7 @@ def build_slot_lattice(
     establishment: Establishment,
     wings: Sequence[Wing],
     collapse_progress: Dict[int, float] | None = None,
+    garrison_spin: float = 0.0,
     engagement_center: Optional[Tuple[float, float]] = None,
     engagement_heading: float = 0.0,
 ) -> List[Slot]:
@@ -564,13 +596,35 @@ def build_slot_lattice(
                 ring_radius=radius,
             ))
 
-    # 3. Arrest guards: a neutralized hull is never left unattended.
-    for wing_id in sorted(establishment.guards.keys()):
+    # 3. Standing garrisons on arrested hulls. Each garrison is a complete sub-formation: a
+    #    strike element stationed close in, and a tracker ring circling the hull. Both rings
+    #    PRECESS with `garrison_spin`, so the station each vessel holds sweeps around the hull
+    #    and the garrison visibly circles it rather than parking on a fixed bearing.
+    for wing_id in sorted(set(establishment.garrison_interceptors) | set(establishment.guards)):
         wing = wing_by_id.get(wing_id)
         if wing is None:
             continue
-        for k in range(establishment.guards[wing_id]):
-            phase = wrap_angle(wing.ref_heading + math.pi + (2.0 * math.pi / 3.0) * k)
+
+        n_int = establishment.garrison_interceptors.get(wing_id, 0)
+        for k in range(n_int):
+            phase = wrap_angle(wing.ref_heading + garrison_spin
+                               + (2.0 * math.pi / max(1, n_int)) * k)
+            slots.append(Slot(
+                key=f"gint:w{wing_id}:#{k}",
+                role=ROLE_INTERCEPTOR,
+                kind=KIND_GUARD,
+                point=(wing.center[0] + R_GARRISON_ESCORT * math.cos(phase),
+                       wing.center[1] + R_GARRISON_ESCORT * math.sin(phase)),
+                target_id=wing.primary_target_id,
+                phase_angle=phase,
+                ring_radius=R_GARRISON_ESCORT,
+            ))
+
+        n_trk = establishment.guards.get(wing_id, 0)
+        for k in range(n_trk):
+            # Counter-phased against the strike element so the two rings do not stack up.
+            phase = wrap_angle(wing.ref_heading + math.pi + garrison_spin
+                               + (2.0 * math.pi / max(1, n_trk)) * k)
             slots.append(Slot(
                 key=f"grd:w{wing_id}:#{k}",
                 role=ROLE_TRACKER,
@@ -582,28 +636,62 @@ def build_slot_lattice(
                 ring_radius=R_ARREST_GUARD,
             ))
 
-    # 4. Relay mesh backbone: astern of the engagement box, bridging every wing.
+    # 4. Relay mesh backbone. With the fleet dispersed across several garrisons the backbone's
+    #    job is to BRIDGE them, so relays are stationed on the chords between wing centres
+    #    rather than all sitting astern of one engagement box. A single relay holds the
+    #    centroid, where it is in range of every garrison at once.
+    centres = [w.center for w in wings]
+    bridge_points: List[Tuple[float, float]] = []
+    if len(centres) >= 2:
+        for a in range(len(centres)):
+            for b in range(a + 1, len(centres)):
+                bridge_points.append(((centres[a][0] + centres[b][0]) / 2.0,
+                                      (centres[a][1] + centres[b][1]) / 2.0))
+
     for k in range(establishment.relays):
-        spread = 0.0 if establishment.relays == 1 else (k - (establishment.relays - 1) / 2.0) * 0.55
-        bearing = wrap_angle(engagement_heading + math.pi + 0.8 + spread)
+        if bridge_points and establishment.relays > 1:
+            point = clear_of_hulls(bridge_points[k % len(bridge_points)], wings)
+            bearing = math.atan2(point[1] - ey, point[0] - ex)
+            radius = math.hypot(point[0] - ex, point[1] - ey)
+        elif bridge_points:
+            # One relay: as central as possible, in reach of every garrison, but clear of hulls.
+            point = clear_of_hulls((ex, ey), wings)
+            bearing = math.atan2(point[1] - ey, point[0] - ex) if point != (ex, ey) else \
+                wrap_angle(engagement_heading + math.pi)
+            radius = math.hypot(point[0] - ex, point[1] - ey)
+        else:
+            spread = 0.0 if establishment.relays == 1 else (k - (establishment.relays - 1) / 2.0) * 0.55
+            bearing = wrap_angle(engagement_heading + math.pi + 0.8 + spread)
+            point = (ex + R_MESH_BACKBONE * math.cos(bearing),
+                     ey + R_MESH_BACKBONE * math.sin(bearing))
+            radius = R_MESH_BACKBONE
         slots.append(Slot(
             key=f"rly:fleet:#{k}",
             role=ROLE_RELAY,
             kind=KIND_MESH,
-            point=(ex + R_MESH_BACKBONE * math.cos(bearing),
-                   ey + R_MESH_BACKBONE * math.sin(bearing)),
-            target_id=_nearest_target_id(wings, (ex + R_MESH_BACKBONE * math.cos(bearing),
-                                                 ey + R_MESH_BACKBONE * math.sin(bearing))),
+            point=point,
+            target_id=_nearest_target_id(wings, point),
             phase_angle=bearing,
-            ring_radius=R_MESH_BACKBONE,
+            ring_radius=radius,
         ))
 
-    # 5. Scout pickets: wide-area early warning around the whole engagement box.
+    # 5. Scout pickets: wide-area early warning around the WHOLE formation. The picket radius
+    #    grows with how far apart the garrisons are, so a dispersed fleet is not screened by a
+    #    ring that sits inside it.
+    extent = 0.0
+    for a in range(len(centres)):
+        for b in range(a + 1, len(centres)):
+            extent = max(extent, math.hypot(centres[a][0] - centres[b][0],
+                                            centres[a][1] - centres[b][1]))
+    picket_radius = max(R_PICKET, extent * 0.5 + 25.0)
+
     for k in range(establishment.scouts):
         bearing = wrap_angle(
             engagement_heading + 0.5 + (2.0 * math.pi / max(1, establishment.scouts)) * k
         )
-        point = (ex + R_PICKET * math.cos(bearing), ey + R_PICKET * math.sin(bearing))
+        point = clear_of_hulls(
+            (ex + picket_radius * math.cos(bearing), ey + picket_radius * math.sin(bearing)),
+            wings)
         slots.append(Slot(
             key=f"sct:fleet:#{k}",
             role=ROLE_SCOUT,
@@ -611,7 +699,7 @@ def build_slot_lattice(
             point=point,
             target_id=_nearest_target_id(wings, point),
             phase_angle=bearing,
-            ring_radius=R_PICKET,
+            ring_radius=picket_radius,
         ))
 
     # 6. Rear casualty stations: dead-in-water hulls drift clear of the engagement.
@@ -631,6 +719,51 @@ def build_slot_lattice(
         ))
 
     return slots
+
+
+def _formation_axis(wings: Sequence[Wing]) -> Tuple[float, float]:
+    """Unit vector along the widest separation in the formation; +x for a single wing."""
+    best = (1.0, 0.0)
+    best_d = 0.0
+    for a in range(len(wings)):
+        for b in range(a + 1, len(wings)):
+            dx = wings[b].center[0] - wings[a].center[0]
+            dy = wings[b].center[1] - wings[a].center[1]
+            d = math.hypot(dx, dy)
+            if d > best_d:
+                best_d = d
+                best = (dx / d, dy / d)
+    return best
+
+
+def clear_of_hulls(
+    point: Tuple[float, float],
+    wings: Sequence[Wing],
+    standoff: float = R_FLEET_STATION_STANDOFF,
+) -> Tuple[float, float]:
+    """
+    Pushes a fleet-level station clear of every hostile hull while keeping it as central as
+    possible, so a bridging relay or a picket is never commanded onto a hull the safety shield
+    will then spend the rest of the mission shoving it away from.
+    """
+    if not wings:
+        return point
+
+    px, py = point
+    for _ in range(8):
+        nearest = min(wings, key=lambda w: math.hypot(w.center[0] - px, w.center[1] - py))
+        dx = px - nearest.center[0]
+        dy = py - nearest.center[1]
+        d = math.hypot(dx, dy)
+        if d >= standoff:
+            break
+        if d < 1e-6:
+            # Sitting exactly on a hull: break the tie across the formation axis.
+            ax, ay = _formation_axis(wings)
+            dx, dy, d = -ay, ax, 1.0
+        px = nearest.center[0] + (dx / d) * standoff
+        py = nearest.center[1] + (dy / d) * standoff
+    return (px, py)
 
 
 def _nearest_target_id(wings: Sequence[Wing], point: Tuple[float, float]) -> int:

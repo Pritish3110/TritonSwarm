@@ -29,6 +29,7 @@ import numpy as np
 
 import rclpy
 from rclpy.node import Node
+from rclpy.executors import ExternalShutdownException
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Float32
@@ -315,10 +316,18 @@ class USVPolicyExecutorNode(Node):
 
             is_interceptor = "interceptor" in role
             is_tracker = "tracker" in role
-            slot_kind = "stern" if is_interceptor else ("ring" if is_tracker else "station")
-            pincer_active = is_tracker and ring_radius < 18.0
-
             defusal = self.defusal_progress.get(wing, 0.0)
+            # Once a hostile is arrested, the interceptors and trackers committed to it are
+            # garrisoning it: the strike element included, which circles the hull rather than
+            # holding a terminal capture corridor that no longer has anything to capture.
+            # Relays and scouts are NOT garrison members -- they hold fleet-level stations
+            # (the mesh backbone and the wide-area picket) that span the whole formation, and
+            # treating them as orbiters would have them circle a hull instead of doing their job.
+            is_garrison = (defusal >= 100.0) and (is_interceptor or is_tracker)
+            slot_kind = ("guard" if is_garrison
+                         else ("stern" if is_interceptor else ("ring" if is_tracker else "station")))
+            pincer_active = is_tracker and not is_garrison and ring_radius < 18.0
+
             phase = select_phase(
                 role=role,
                 slot_kind=slot_kind,
@@ -347,12 +356,20 @@ class USVPolicyExecutorNode(Node):
                 r_geo = pn.yaw_rate_cmd
                 u_geo = speed_profile(phase, d_station, target_speed, health=h_i)
 
-            elif is_tracker and phase in (GuidancePhase.SHADOW, GuidancePhase.PINCER,
-                                          GuidancePhase.DEPLOY, GuidancePhase.ARREST_GUARD):
+            elif (is_tracker or is_garrison) and phase in (
+                    GuidancePhase.SHADOW, GuidancePhase.PINCER,
+                    GuidancePhase.DEPLOY, GuidancePhase.ARREST_GUARD):
                 # Lyapunov standoff-orbit field with the hostile's own velocity as feed-forward,
                 # phase-locked onto the assigned ring station. Without the feed-forward term the
                 # ring translates out from under the tracker and containment never closes.
-                orbit_speed = 1.3 if phase is not GuidancePhase.PINCER else 1.75
+                # A garrison holds a precessing station around a stationary hull, so it needs
+                # enough orbit rate to keep sweeping round rather than settling on a bearing.
+                if phase is GuidancePhase.PINCER:
+                    orbit_speed = 1.75
+                elif is_garrison:
+                    orbit_speed = 1.5
+                else:
+                    orbit_speed = 1.3
                 sol = standoff_orbit_command(
                     own_pos=(x, y), center=(tx, ty), center_vel=(tvx, tvy),
                     radius=max(ring_radius, 1.0), station_bearing=station_bearing,
@@ -432,8 +449,10 @@ class USVPolicyExecutorNode(Node):
             role_i = self.assigned_roles.get(i, "").lower()
             if "interceptor" in role_i and phase in (GuidancePhase.TERMINAL, GuidancePhase.EMP_LOCK):
                 law = "PN-LEAD"
+            elif phase is GuidancePhase.ARREST_GUARD:
+                law = "GARRISON-ORBIT"
             elif "tracker" in role_i and phase in (GuidancePhase.SHADOW, GuidancePhase.PINCER,
-                                                   GuidancePhase.DEPLOY, GuidancePhase.ARREST_GUARD):
+                                                   GuidancePhase.DEPLOY):
                 law = "ORBIT-FIELD"
             else:
                 law = "WAYPOINT"
@@ -457,11 +476,17 @@ def main(args=None):
     node = USVPolicyExecutorNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
+        # On SIGINT rclpy tears the context down from its own signal handler, so spin raises
+        # ExternalShutdownException rather than KeyboardInterrupt. Leaving that uncaught, and
+        # then calling shutdown() on an already-dead context, left nodes alive after the
+        # launch exited. A surviving sim_core then publishes onto the same topics as the next
+        # run, which silently corrupts it -- two simulators fighting over /target_{m}/odom.
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':
