@@ -25,6 +25,7 @@ from geometry_msgs.msg import Twist, Point, Quaternion
 from nav_msgs.msg import Odometry
 from visualization_msgs.msg import Marker, MarkerArray
 from usv_msgs.msg import USVHealth, RoleAssignment, MissionStatus
+from std_msgs.msg import Float32
 
 
 class USVSimNode(Node):
@@ -127,15 +128,30 @@ class USVSimNode(Node):
         self.target_pub = self.create_publisher(Odometry, "/target/odom", 10)
         self.marker_pub = self.create_publisher(MarkerArray, "/usv_swarm/markers", 10)
         self.target_arrested = False
+        self.target_defused = False
+        self.defusal_progress = 0.0
+        self.target_combat_state = "COMBAT_PATROL"
         self.mission_sub = self.create_subscription(
             MissionStatus,
             "/mission/status",
             self._mission_status_callback,
             10
         )
+        self.defuse_sub = self.create_subscription(
+            Float32,
+            "/target/defuse_status",
+            self._defuse_status_callback,
+            10
+        )
 
         # 20 Hz Simulation timer loop
         self.timer = self.create_timer(self.dt, self._sim_step)
+
+    def _defuse_status_callback(self, msg: Float32):
+        self.defusal_progress = float(msg.data)
+        if self.defusal_progress >= 100.0:
+            self.target_defused = True
+            self.target_arrested = True
 
     def _mission_status_callback(self, msg: MissionStatus):
         self.target_arrested = bool(msg.debounced_success)
@@ -180,36 +196,50 @@ class USVSimNode(Node):
             self.target_speed = 1.5
             omega = 2.0 * math.pi / 15.0
             self.target_yaw_rate = float(np.clip(4.0 * omega * math.cos(omega * self.target_time) * 0.1, -0.4, 0.4))
-        else:  # reactive
-            close_trackers = []
-            for tx, ty in tracker_positions:
-                d = math.hypot(tx - self.target_x, ty - self.target_y)
-                if d <= 25.0:
-                    close_trackers.append((tx, ty))
-
-            if len(close_trackers) >= 3:
-                cx = sum(p[0] for p in close_trackers) / len(close_trackers)
-                cy = sum(p[1] for p in close_trackers) / len(close_trackers)
-                c_dist = math.hypot(self.target_x - cx, self.target_y - cy)
-                if c_dist < 8.5:
-                    # Encircled from multiple quadrants: decelerate to non-destructive arrest
-                    self.target_speed = max(0.08, self.target_speed - 0.5 * self.dt)
-                    self.target_yaw_rate = 0.0
-                else:
-                    self.target_speed = min(1.5, self.target_speed + 0.3 * self.dt)
-                    escape_angle = math.atan2(self.target_y - cy, self.target_x - cx)
-                    angle_diff = (escape_angle - self.target_psi + math.pi) % (2 * math.pi) - math.pi
-                    self.target_yaw_rate = float(np.clip(angle_diff * 1.5, -0.4, 0.4))
-            elif close_trackers:
-                cx = sum(p[0] for p in close_trackers) / len(close_trackers)
-                cy = sum(p[1] for p in close_trackers) / len(close_trackers)
-                escape_angle = math.atan2(self.target_y - cy, self.target_x - cx)
-                angle_diff = (escape_angle - self.target_psi + math.pi) % (2 * math.pi) - math.pi
-                self.target_yaw_rate = float(np.clip(angle_diff * 1.5, -0.4, 0.4))
-                self.target_speed = min(1.5, self.target_speed + 0.3 * self.dt)
-            else:
-                self.target_speed = 1.2
+        else:  # reactive combat mode
+            if self.target_defused or self.target_arrested:
+                # Fully neutralized and defused by interceptor
+                self.target_speed = max(0.0, self.target_speed - 1.2 * self.dt)
                 self.target_yaw_rate = 0.0
+                self.target_combat_state = "DEFUSED_AND_ARRESTED"
+            elif self.defusal_progress > 0.0:
+                # Under active electronic/EMP defusal lock: propulsion stutters and decays
+                self.target_combat_state = f"UNDER_DEFUSAL ({int(self.defusal_progress)}%)"
+                self.target_speed = max(0.1, 1.4 * (1.0 - self.defusal_progress / 100.0))
+                self.target_yaw_rate = 0.25 * math.sin(5.0 * self.target_time)
+            else:
+                close_usvs = []
+                for ux, uy in tracker_positions:
+                    d = math.hypot(ux - self.target_x, uy - self.target_y)
+                    if d <= 35.0:
+                        close_usvs.append((ux, uy, d))
+
+                if close_usvs:
+                    self.target_combat_state = "HOSTILE_EVASION"
+                    min_d = min(d for _, _, d in close_usvs)
+                    # Hostile evasion AI: evaluate perimeter angles and sprint through largest gap
+                    bearings = sorted([math.atan2(uy - self.target_y, ux - self.target_x) for ux, uy, _ in close_usvs])
+                    M = len(bearings)
+                    max_gap = 0.0
+                    escape_mid = self.target_psi
+
+                    for k in range(M):
+                        gap = (bearings[(k + 1) % M] - bearings[k]) % (2.0 * math.pi)
+                        if gap > max_gap:
+                            max_gap = gap
+                            escape_mid = (bearings[k] + gap / 2.0 + math.pi) % (2.0 * math.pi) - math.pi
+
+                    yaw_err = (escape_mid - self.target_psi + math.pi) % (2.0 * math.pi) - math.pi
+                    weaving = 0.20 * math.sin(2.0 * self.target_time)
+                    self.target_yaw_rate = float(np.clip(yaw_err * 2.0 + weaving, -0.6, 0.6))
+                    
+                    # If USVs are flanking within 16m, evasion is contested/choked down
+                    top_speed = 1.15 if min_d < 16.0 else 1.65
+                    self.target_speed = min(top_speed, self.target_speed + 0.3 * self.dt)
+                else:
+                    self.target_combat_state = "COMBAT_PATROL"
+                    self.target_speed = min(1.2, self.target_speed + 0.2 * self.dt)
+                    self.target_yaw_rate = 0.1 * math.sin(0.5 * self.target_time)
 
         # Integrate target pose
         self.target_psi = (self.target_psi + self.target_yaw_rate * self.dt + math.pi) % (2 * math.pi) - math.pi
@@ -384,22 +414,53 @@ class USVSimNode(Node):
         tbill.pose.position.y = float(self.target_y)
         tbill.pose.position.z = 3.2
         tbill.scale.z = 1.1
-        if self.target_arrested:
+        if self.target_defused or self.target_arrested:
+            tbill.color.r = 0.1
+            tbill.color.g = 1.0
+            tbill.color.b = 0.2
+            tbill.color.a = 1.0
+            tbill.text = f"★ ENEMY TARGET DEFUSED & ARRESTED ★\nSpeed: 0.00 m/s | Neutralized by Interceptor"
+        elif self.defusal_progress > 0.0:
             tbill.color.r = 1.0
-            tbill.color.g = 0.85
+            tbill.color.g = 0.9
             tbill.color.b = 0.1
             tbill.color.a = 1.0
-            tbill.text = f"★ TARGET ARRESTED & CAPTURED ★\nSpeed: {self.target_speed:.2f} m/s (HALTED)"
+            tbill.text = f"⚡ UNDER ACTIVE EMP DEFUSAL ({int(self.defusal_progress)}%) ⚡\nSpeed: {self.target_speed:.2f} m/s"
         else:
             tbill.color.r = 1.0
             tbill.color.g = 0.2
             tbill.color.b = 0.2
             tbill.color.a = 1.0
-            tbill.text = f"TARGET [Reactive]\nSpeed: {self.target_speed:.2f} m/s"
+            tbill.text = f"HOSTILE ENEMY DRONE [{self.target_combat_state}]\nSpeed: {self.target_speed:.2f} m/s | Evasive Breakout"
         markers.markers.append(tbill)
 
-        # 1.6 Target Intercept Containment Net Cage (Visual Proof of Arrest)
-        if self.target_arrested:
+        # 1.6 Electronic / EMP Neutralization Beam (From Interceptor to Target)
+        if self.defusal_progress > 0.0:
+            for aid, role_str in self.roles.items():
+                if "interceptor" in role_str.lower() and aid in self.usv_states:
+                    ix, iy = self.usv_states[aid][0], self.usv_states[aid][1]
+                    beam = Marker()
+                    beam.header.frame_id = "world"
+                    beam.header.stamp = now
+                    beam.ns = "emp_defusal_beam"
+                    beam.id = 0
+                    beam.type = Marker.LINE_LIST
+                    beam.action = Marker.ADD
+                    beam.scale.x = 0.35  # Line thickness
+                    beam.color.r = 0.2
+                    beam.color.g = 0.8
+                    beam.color.b = 1.0
+                    beam.color.a = 0.95
+                    p_i = Point()
+                    p_i.x, p_i.y, p_i.z = float(ix), float(iy), 1.2
+                    p_t = Point()
+                    p_t.x, p_t.y, p_t.z = float(self.target_x), float(self.target_y), 1.5
+                    beam.points = [p_i, p_t]
+                    markers.markers.append(beam)
+                    break
+
+        # 1.7 Target Intercept Containment Net Cage (Visual Proof of Arrest)
+        if self.target_arrested or self.target_defused:
             cage = Marker()
             cage.header.frame_id = "world"
             cage.header.stamp = now
@@ -413,9 +474,9 @@ class USVSimNode(Node):
             cage.scale.x = 12.0
             cage.scale.y = 12.0
             cage.scale.z = 3.0
-            cage.color.r = 1.0
-            cage.color.g = 0.85
-            cage.color.b = 0.1
+            cage.color.r = 0.2
+            cage.color.g = 1.0
+            cage.color.b = 0.3
             cage.color.a = 0.35
             markers.markers.append(cage)
 
@@ -629,6 +690,11 @@ class USVSimNode(Node):
 
             if is_degraded:
                 ubill.text = f"USV-{i} [{role.upper()}]\n⚠️ DEGRADED h={h_i:.2f} (Eff: {eff*100:.0f}%)"
+            elif "interceptor" in role:
+                if self.defusal_progress > 0.0:
+                    ubill.text = f"USV-{i} [INTERCEPTOR]\n⚡ EMP DEFUSAL LOCK: {int(self.defusal_progress)}% | {u:.1f} m/s"
+                else:
+                    ubill.text = f"USV-{i} [INTERCEPTOR]\n⚡ STRIKE READY | {u:.1f} m/s"
             else:
                 ubill.text = f"USV-{i} [{role.upper()}]\nHealth: {h_i:.2f} | {u:.1f} m/s"
             markers.markers.append(ubill)

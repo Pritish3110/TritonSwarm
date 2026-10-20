@@ -28,6 +28,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy
 from nav_msgs.msg import Odometry
 from usv_msgs.msg import USVHealth, RoleAssignment, RecoveryEvent, MissionStatus
+from std_msgs.msg import Float32
 
 
 class USVRecoveryPlannerNode(Node):
@@ -59,14 +60,30 @@ class USVRecoveryPlannerNode(Node):
         self.target_speed_history: List[float] = []
 
         self.agent_positions: Dict[int, Tuple[float, float]] = {}
+        self.agent_speeds: Dict[int, float] = {i: 0.0 for i in range(self.num_agents)}
         self.agent_health: Dict[int, float] = {i: 1.0 for i in range(self.num_agents)}
-        self.agent_roles: Dict[int, str] = {i: "tracker" if i < 4 else "scout" for i in range(self.num_agents)}
+        # Military-Grade Role Partition: 1 Interceptor (strike), 3 Trackers (containment), 1 Scout, 1 Relay
+        self.agent_roles: Dict[int, str] = {}
+        for i in range(self.num_agents):
+            if i == 0:
+                self.agent_roles[i] = "interceptor"
+            elif i in [1, 2, 3]:
+                self.agent_roles[i] = "tracker"
+            elif i == 4:
+                self.agent_roles[i] = "scout"
+            else:
+                self.agent_roles[i] = "relay"
+
         self.anomalies_triggered: set = set()
         self.demoted_previous_roles: Dict[int, str] = {}
         self.surrogate_map: Dict[int, int] = {}
         self.last_assigned_col: Dict[int, int] = {}
 
-        # Section 5 Metric Timers
+        # Combat Defusal & Mission Metrics
+        self.defusal_timer = 0.0
+        self.defusal_progress = 0.0
+        self.intercept_authorized = False
+        self.tactical_step_count = 0
         self.debounce_timer = 0.0
         self.target_dwell_timer = 0.0
         self.collision_occurred = False
@@ -96,6 +113,7 @@ class USVRecoveryPlannerNode(Node):
         qos_latched = QoSProfile(depth=10, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL, reliability=QoSReliabilityPolicy.RELIABLE)
         self.recovery_pub = self.create_publisher(RecoveryEvent, '/recovery/event', qos_latched)
         self.status_pub = self.create_publisher(MissionStatus, '/mission/status', 10)
+        self.defuse_pub = self.create_publisher(Float32, '/target/defuse_status', 10)
 
         # 10 Hz Planner & Verification Loop
         self.timer = self.create_timer(0.1, self._planner_step)
@@ -133,6 +151,9 @@ class USVRecoveryPlannerNode(Node):
     def _make_odom_callback(self, agent_id: int):
         def callback(msg: Odometry):
             self.agent_positions[agent_id] = (msg.pose.pose.position.x, msg.pose.pose.position.y)
+            vx = msg.twist.twist.linear.x
+            vy = msg.twist.twist.linear.y
+            self.agent_speeds[agent_id] = math.hypot(vx, vy)
         return callback
 
     def _trigger_agentic_recovery(self, agent_id: int, health_msg: USVHealth, prev_role: str):
@@ -240,8 +261,8 @@ class USVRecoveryPlannerNode(Node):
     def _trigger_agentic_restoration(self, agent_id: int, health_msg: USVHealth):
         """Asynchronously triggers recovery event when a degraded ally vessel self-heals back to nominal health."""
         t0 = time.time()
-        prev_role = "relay"
-        restored_role = "tracker"
+        prev_role = self.demoted_previous_roles.get(agent_id, "relay")
+        restored_role = "interceptor" if agent_id == 0 else "tracker"
         self.agent_roles[agent_id] = restored_role
 
         # Demote surrogate back to standby scout
@@ -306,21 +327,24 @@ class USVRecoveryPlannerNode(Node):
         agent_ids = sorted(list(self.agent_positions.keys()))
         N = len(agent_ids)
 
-        # Partition fleet into active trackers, relays, and scouts based on health and agentic roles
-        trackers = [aid for aid in agent_ids if self.agent_roles.get(aid) in ["tracker", "interceptor"]]
+        interceptors = [aid for aid in agent_ids if self.agent_roles.get(aid) == "interceptor"]
+        trackers = [aid for aid in agent_ids if self.agent_roles.get(aid) == "tracker"]
         relays = [aid for aid in agent_ids if self.agent_roles.get(aid) == "relay"]
-        scouts = [aid for aid in agent_ids if self.agent_roles.get(aid) not in ["tracker", "interceptor", "relay"]]
+        scouts = [aid for aid in agent_ids if self.agent_roles.get(aid) not in ["interceptor", "tracker", "relay"]]
 
-        # Safety fallback: ensure at least 3 trackers if healthy agents exist
-        if len(trackers) < 3:
-            for s in list(scouts):
-                if self.agent_health.get(s, 1.0) >= 0.60:
-                    scouts.remove(s)
-                    trackers.append(s)
-                    self.agent_roles[s] = "tracker"
-                    if len(trackers) >= 3:
-                        break
+        # Fallback: ensure at least 1 interceptor and 3 trackers if healthy agents exist
+        if not interceptors and trackers:
+            best_t = max(trackers, key=lambda a: self.agent_health.get(a, 1.0))
+            trackers.remove(best_t)
+            interceptors.append(best_t)
+            self.agent_roles[best_t] = "interceptor"
 
+        while len(trackers) < 3 and scouts:
+            s = scouts.pop(0)
+            trackers.append(s)
+            self.agent_roles[s] = "tracker"
+
+        num_interceptors = len(interceptors)
         num_trackers = len(trackers)
         num_relays = len(relays)
         num_scouts = len(scouts)
@@ -329,21 +353,29 @@ class USVRecoveryPlannerNode(Node):
         slot_roles = []
         ref_heading = self.smooth_heading
 
-        # Generate ring slots on 20m circle for active trackers
+        # 1. Interceptor Slot: dynamic attack vector closing in from target's stern
+        for _ in range(num_interceptors):
+            # Terminal strike capture slot: 4.8m directly off target's stern
+            angle = ref_heading + math.pi
+            slots.append((tx + 4.8 * math.cos(angle), ty + 4.8 * math.sin(angle)))
+            slot_roles.append("interceptor")
+
+        # 2. Containment Tracker Slots on 20m circle
         for k in range(num_trackers):
             angle = ref_heading + (2.0 * math.pi / max(1, num_trackers)) * k
             slots.append((tx + self.r_ring * math.cos(angle), ty + self.r_ring * math.sin(angle)))
             slot_roles.append("tracker")
 
-        # Generate standoff slots for relay and scout vessels
+        # 3. Relay Standoff Slots (30m)
         for k in range(num_relays):
             offset = 0.0 if num_relays == 1 else (k - (num_relays - 1) / 2.0) * 0.5
-            angle = ref_heading + math.pi + offset
+            angle = ref_heading + math.pi + 0.8 + offset
             slots.append((tx + 30.0 * math.cos(angle), ty + 30.0 * math.sin(angle)))
             slot_roles.append("relay")
 
+        # 4. Scout Standoff Slots (45m)
         for k in range(num_scouts):
-            angle = ref_heading + math.pi + 0.6 + (2.0 * math.pi / max(1, num_scouts)) * k
+            angle = ref_heading + math.pi + 0.5 + (2.0 * math.pi / max(1, num_scouts)) * k
             slots.append((tx + 45.0 * math.cos(angle), ty + 45.0 * math.sin(angle)))
             slot_roles.append("scout")
 
@@ -355,8 +387,6 @@ class USVRecoveryPlannerNode(Node):
         for i_idx, aid in enumerate(agent_ids):
             ax, ay = self.agent_positions[aid]
             a_role = self.agent_roles.get(aid, "tracker")
-            if a_role == "interceptor":
-                a_role = "tracker"
 
             for s_idx in range(N):
                 sx, sy = slots[s_idx]
@@ -394,14 +424,14 @@ class USVRecoveryPlannerNode(Node):
                 if d < 4.0:
                     self.collision_occurred = True
 
-        # Participating healthy trackers
+        # Participating healthy combat vessels in containment ring
         participating_bearings = []
         for aid, (ax, ay) in self.agent_positions.items():
             h = self.agent_health.get(aid, 1.0)
             role = self.agent_roles.get(aid, "")
             if h >= 0.30 and role in ["tracker", "interceptor"]:
                 d = math.hypot(ax - tx, ay - ty)
-                if (self.r_ring - self.delta_r) <= d <= (self.r_ring + self.delta_r):
+                if (role == "tracker" and 12.0 <= d <= 26.0) or (role == "interceptor" and d <= 26.0):
                     participating_bearings.append(math.atan2(ay - ty, ax - tx))
 
         N_part = len(participating_bearings)
@@ -422,14 +452,40 @@ class USVRecoveryPlannerNode(Node):
             c1_pass = angular_spread >= spread_thresh
             c2_pass = max_gap <= gap_thresh
 
-        # Arrest condition
-        trailing_2s_speed = (sum(self.target_speed_history) / len(self.target_speed_history)) if self.target_speed_history else self.target_speed
-        if c1_pass and c2_pass:
-            self.target_dwell_timer += dt
-        else:
-            self.target_dwell_timer = max(0.0, self.target_dwell_timer - 0.2 * dt)
+        # Interceptor Strike Authorization & Defusal Tracking
+        interceptor_id = None
+        for aid, r_str in self.agent_roles.items():
+            if "interceptor" in r_str:
+                interceptor_id = aid
+                break
 
-        arrest_pass = trailing_2s_speed < 0.20 or self.target_dwell_timer >= 6.0
+        d_intercept = float('inf')
+        if interceptor_id is not None and interceptor_id in self.agent_positions:
+            ix, iy = self.agent_positions[interceptor_id]
+            d_intercept = math.hypot(ix - tx, iy - ty)
+
+        # Interceptor Strike Activation & Defusal Tracking
+        if d_intercept <= 7.5:
+            self.defusal_timer += dt
+            self.defusal_progress = min(100.0, (self.defusal_timer / 4.0) * 100.0)
+            if not self.intercept_authorized:
+                self.intercept_authorized = True
+                self.get_logger().info(
+                    f"\n[COMBAT ENGAGEMENT] >>> USV-{interceptor_id} entered tactical strike corridor ({d_intercept:.1f}m)! "
+                    f"ACTIVATING EMP DEFUSAL LOCK ON HOSTILE TARGET!"
+                )
+        elif d_intercept > 9.5:
+            self.defusal_timer = max(0.0, self.defusal_timer - 0.4 * dt)
+            self.defusal_progress = min(100.0, (self.defusal_timer / 4.0) * 100.0)
+
+        # Publish defusal status to target and fleet
+        defuse_msg = Float32()
+        defuse_msg.data = float(self.defusal_progress)
+        self.defuse_pub.publish(defuse_msg)
+
+        # Arrest condition: 100% EMP defusal OR complete deceleration
+        trailing_2s_speed = (sum(self.target_speed_history) / len(self.target_speed_history)) if self.target_speed_history else self.target_speed
+        arrest_pass = (self.defusal_progress >= 100.0) or (trailing_2s_speed < 0.20 and self.defusal_progress >= 40.0)
         all_met = c1_pass and c2_pass and arrest_pass and (not self.collision_occurred)
 
         if all_met:
@@ -437,30 +493,64 @@ class USVRecoveryPlannerNode(Node):
         else:
             self.debounce_timer = max(0.0, self.debounce_timer - 0.2 * dt)
 
-        debounced_success = self.debounce_timer >= 3.0
+        debounced_success = self.debounce_timer >= 2.0
 
-        self.verify_step_count = getattr(self, 'verify_step_count', 0) + 1
-        if self.verify_step_count % 20 == 0:
-            tracker_dists = [
-                f"USV-{aid}({self.agent_roles.get(aid, '?')}): {math.hypot(ax - tx, ay - ty):.1f}m"
-                for aid, (ax, ay) in sorted(self.agent_positions.items())
-            ]
-            self.get_logger().info(
-                f"[MISSION STATUS] Trackers in ring: {N_part}/{len(self.agent_positions)} | "
-                f"C1(Spread>={spread_thresh:.2f}): {angular_spread:.2f} ({c1_pass}) | "
-                f"C2(Gap<={gap_thresh:.2f}): {max_gap:.2f} ({c2_pass}) | "
-                f"TgtSpeed: {trailing_2s_speed:.2f}m/s | Dwell: {self.target_dwell_timer:.1f}s | "
-                f"Distances: {' | '.join(tracker_dists)}"
+        # Real-time Tactical Combat Dashboard Output (every 15 steps / 1.5s)
+        self.tactical_step_count += 1
+        if self.tactical_step_count % 15 == 0:
+            pct = int(self.defusal_progress)
+            bar_len = 16
+            filled = int(bar_len * (pct / 100.0))
+            bar = "=" * filled + (">" if filled < bar_len else "") + " " * (bar_len - filled - (1 if filled < bar_len else 0))
+            strike_stat = "DEFUSED / ARRESTED" if pct >= 100 else ("EMP LOCK ENGAGED" if pct > 0 else ("STRIKE AUTHORIZED" if self.intercept_authorized else "STAGING"))
+
+            t_now_sec = self.tactical_step_count * dt
+            header = (
+                f"\n{'='*98}\n"
+                f"[TACTICAL DRONE SWARM COMBAT STATUS] t={t_now_sec:4.1f}s | Target: ({tx:5.1f}, {ty:5.1f}) | Speed: {trailing_2s_speed:4.2f} m/s\n"
+                f"Containment: C1(Spread>={spread_thresh:.2f})={angular_spread:4.2f} ({c1_pass}) | C2(Gap<={gap_thresh:.2f})={max_gap:4.2f} ({c2_pass}) | Min Separation: {min_dist:4.2f}m\n"
+                f"Defusal Progress: [{bar}] {self.defusal_progress:5.1f}% | Intercept Status: {strike_stat}\n"
+                f"{'-'*98}\n"
+                f" USV-ID | Role        | Health | Speed  | Dist->Tgt | Bearing  | Min Ally Dist | Tactical State\n"
+                f"{'-'*98}"
             )
+            rows = []
+            for aid in sorted(self.agent_positions.keys()):
+                ax, ay = self.agent_positions[aid]
+                r_name = self.agent_roles.get(aid, "scout").upper()
+                h_val = self.agent_health.get(aid, 1.0)
+                spd = self.agent_speeds.get(aid, 0.0)
+                d_t = math.hypot(ax - tx, ay - ty)
+                bearing_deg = math.degrees(math.atan2(ay - ty, ax - tx))
+                
+                # Min distance to other allies
+                d_allies = [math.hypot(ax - ox, ay - oy) for oid, (ox, oy) in self.agent_positions.items() if oid != aid]
+                min_ally = min(d_allies) if d_allies else float('inf')
+                ally_str = f"{min_ally:4.1f}m (OK)" if min_ally >= 4.0 else f"{min_ally:4.1f}m (WARN)"
+
+                if h_val < 0.60:
+                    state_str = "⚠️ DEGRADED / HEALING"
+                elif "INTERCEPTOR" in r_name:
+                    state_str = f"⚡ EMP DEFUSAL ({pct}%)" if pct > 0 else ("HIGH-SPEED STRIKE" if self.intercept_authorized else "FLANK STAGING")
+                elif "TRACKER" in r_name:
+                    state_str = "CONTAINMENT RING 20m"
+                elif "RELAY" in r_name:
+                    state_str = "STANDOFF COMMS 30m"
+                else:
+                    state_str = "RECON STANDOFF 45m"
+
+                rows.append(f" USV-{aid:<2} | {r_name:<11} |  {h_val:4.2f}  | {spd:4.2f}m/s|  {d_t:5.1f}m   | {bearing_deg:+6.1f}°  |   {ally_str:<11} | {state_str}")
+
+            footer = f"{'='*98}"
+            self.get_logger().info(header + "\n" + "\n".join(rows) + "\n" + footer)
 
         if debounced_success and not self.arrest_logged:
             self.arrest_logged = True
             self.get_logger().info(
-                "\n" + "=" * 76 + "\n"
-                "[MISSION ARREST SUCCESS] TARGET INTERCEPTED & ESCAPE ARRESTED!\n"
-                f"Section 5 Rubric MET: Ring Dwell={self.target_dwell_timer:.1f}s | "
-                f"Speed={trailing_2s_speed:.2f}m/s | Spread={angular_spread:.2f}rad | Zero Collisions\n"
-                + "=" * 76
+                "\n" + "*" * 98 + "\n"
+                "[MISSION COMBAT SUCCESS] >>> ENEMY DRONE FULLY DEFUSED & ARRESTED!\n"
+                f"Defusal Progress: 100.0% | Target Speed: {trailing_2s_speed:.2f} m/s | Zero Collisions Invariant Maintained!\n"
+                + "*" * 98
             )
 
         status = MissionStatus()

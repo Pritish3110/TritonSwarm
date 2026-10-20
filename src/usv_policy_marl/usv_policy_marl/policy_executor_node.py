@@ -209,42 +209,52 @@ class USVPolicyExecutorNode(Node):
             dx = gx - x
             dy = gy - y
 
-            # Circumferential perimeter navigation: prevent cutting across the target core
+            # Circumferential perimeter navigation: prevent non-interceptors from cutting across target core
+            is_interceptor = "interceptor" in role.lower()
             if i in self.target_beliefs:
                 tx, ty, _, _ = self.target_beliefs[i]
                 d_to_tgt = math.hypot(x - tx, y - ty)
                 d_goal_to_tgt = math.hypot(gx - tx, gy - ty)
 
-                # Check if path crosses through target inner perimeter
-                theta_agent = math.atan2(y - ty, x - tx)
-                theta_goal = math.atan2(gy - ty, gx - tx)
-                ang_diff = (theta_goal - theta_agent + math.pi) % (2.0 * math.pi) - math.pi
+                if not is_interceptor:
+                    # Check if path crosses through target inner perimeter
+                    theta_agent = math.atan2(y - ty, x - tx)
+                    theta_goal = math.atan2(gy - ty, gx - tx)
+                    ang_diff = (theta_goal - theta_agent + math.pi) % (2.0 * math.pi) - math.pi
 
-                if abs(ang_diff) > (math.pi / 3.0) and d_to_tgt < 26.0 and d_goal_to_tgt < 26.0:
-                    # Steer along circle circumference towards goal
-                    steer_dir = 1.0 if ang_diff > 0 else -1.0
-                    tangent_ang = theta_agent + steer_dir * (math.pi / 2.0)
-                    wp_x = tx + 20.0 * math.cos(tangent_ang)
-                    wp_y = ty + 20.0 * math.sin(tangent_ang)
-                    dx = wp_x - x
-                    dy = wp_y - y
-                elif d_to_tgt < 16.0:
-                    # Radial push outward if closer than 16m
-                    rad_push = (16.0 - d_to_tgt) * 2.0
-                    dx += math.cos(theta_agent) * rad_push
-                    dy += math.sin(theta_agent) * rad_push
+                    if abs(ang_diff) > (math.pi / 3.0) and d_to_tgt < 26.0 and d_goal_to_tgt < 26.0:
+                        # Steer along circle circumference towards goal
+                        steer_dir = 1.0 if ang_diff > 0 else -1.0
+                        tangent_ang = theta_agent + steer_dir * (math.pi / 2.0)
+                        wp_x = tx + 20.0 * math.cos(tangent_ang)
+                        wp_y = ty + 20.0 * math.sin(tangent_ang)
+                        dx = wp_x - x
+                        dy = wp_y - y
+                    elif d_to_tgt < 16.0:
+                        # Radial push outward if non-interceptor drifts closer than 16m
+                        rad_push = (16.0 - d_to_tgt) * 2.5
+                        dx += math.cos(theta_agent) * rad_push
+                        dy += math.sin(theta_agent) * rad_push
 
             dist = math.hypot(dx, dy)
             target_heading = math.atan2(dy, dx)
             heading_err = (target_heading - psi + math.pi) % (2 * math.pi) - math.pi
 
-            # High-responsiveness slot pursuit profile
+            # High-responsiveness pursuit profile
             is_degraded = h_i < 0.55
             facing_factor = max(0.2, math.cos(heading_err))
 
             if is_degraded:
                 # Safe transit velocity for degraded vessel peeling off to outer standoff
                 speed_des = max(0.4, 1.0 * (h_i / 0.55)) * facing_factor
+            elif is_interceptor:
+                # Interceptor combat strike sprint: aggressive sprint to capture corridor
+                if dist > 8.0:
+                    speed_des = 3.5 * facing_factor
+                elif dist > 2.0:
+                    speed_des = (1.4 + 2.1 * (dist / 8.0)) * facing_factor
+                else:
+                    speed_des = max(0.4, 1.4 * (dist / 2.0))
             elif dist > 12.0:
                 # Fast intercept sprint to close standoff rapidly
                 speed_des = 3.2 * facing_factor
@@ -299,7 +309,11 @@ class USVPolicyExecutorNode(Node):
                 marl_u, marl_r = self._forward_marl_policy(obs)
 
                 # Decoupled transit vs. formation blending
-                if dist > 6.0:
+                if is_interceptor:
+                    # Interceptor executes targeted terminal pursuit
+                    u_cmd = float(speed_des)
+                    r_cmd = float(np.clip(heading_err * 2.4, -0.8, 0.8))
+                elif dist > 6.0:
                     # Standoff transit phase: prioritize rapid slot intercept
                     u_cmd = float(0.85 * speed_des + 0.15 * marl_u)
                     r_cmd = float(np.clip(0.85 * slot_r + 0.15 * marl_r, -0.8, 0.8))
