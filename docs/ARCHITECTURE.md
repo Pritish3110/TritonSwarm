@@ -547,3 +547,69 @@ The scorer was also penalising correct behaviour:
   indistinguishable and it was impossible to tell which one was on screen. `usv_sim_core` now
   takes a `stack_label` parameter, set by each launch file, and prints it as the first line of
   the battle HUD.
+
+---
+
+## 16. Reverted: Strike Staging Gate and Lead-Station Transit
+
+Two changes introduced alongside the ablation study were **reverted**, because they degraded
+the architecture simulation they were supposed to be measuring. The entries describing them in
+§13.2 and §15 are superseded by this section.
+
+### 16.1 What was wrong
+
+**Strike staging gate.** §12 held the strike element at a 22 m staging station until its wing's
+containment ring was established, releasing it under "degraded containment" after a timeout.
+At the default operating point this was unsatisfiable by construction: §14.5 records that
+12 drones cannot ring 3 hostiles simultaneously, because three rings need 3 trackers each plus
+3 interceptors — the entire fleet — leaving nothing for the relay backbone or the scout picket.
+
+The gate therefore *never* passed at 12 v 3. Its only effect was to idle all three interceptors
+for the full 85 s timeout before releasing them to do exactly what they had done before:
+
+```
+[STRIKE AUTHORIZED - DEGRADED] >>> HOSTILE-0: no containment ring after 85s (1 tracker on station)
+[STRIKE AUTHORIZED - DEGRADED] >>> HOSTILE-1: no containment ring after 85s (2 trackers on station)
+[STRIKE AUTHORIZED - DEGRADED] >>> HOSTILE-2: no containment ring after 85s (1 tracker on station)
+```
+
+**Lead-station transit.** `lead_station()` projected ring stations forward along the hostile's
+velocity during transit. It improved the encirclement metric, but added a prediction layer on
+top of guidance that already converges, and it had itself needed clamping (§15) after an
+unbounded horizon made the aim point thrash.
+
+### 16.2 Why they were introduced, and why that was the wrong call
+
+Both existed to raise one number: `active_containment_frac` in the comparison study. Neither
+improved the mission. The gate traded 85 s of idling for a metric that is structurally
+unreachable at the default fleet size — tuning the architecture to flatter its own benchmark
+rather than to accomplish the task. The benchmark is supposed to measure the architecture, not
+steer it.
+
+### 16.3 Measured effect of the revert
+
+Identical configuration throughout (12 drones, 3 hostiles, `role_attrition`):
+
+| | First engagement | All 3 arrested by | Staging gate fired |
+|---|---|---|---|
+| Before the ablation study | 45.0 s | 85.5 s | — |
+| With the staging gate | **99.0 s** | **118.5 s** | 3 times |
+| **After the revert** | **28.5 s** | **79.5 s** | never |
+
+The reverted simulation is *faster than the original*, because the formation-stability work of
+§15 was kept: the fleet commits to its wings immediately instead of thrashing, so it reaches
+the engagement sooner. The collision invariant still holds at zero breaches.
+
+### 16.4 What was kept
+
+- RViz camera control and windowed default (§15.1)
+- Autonomous damage control / self-healing (§13)
+- All formation-stability corrections: hostile spawn spacing, the 22/40 m wing hysteresis band,
+  the scale-invariant wing-switch penalty, and `THREAT_BAND` (§15)
+- The comparison study itself (§14), which now runs entirely from its own launch file
+
+`active_containment_frac` consequently reads near zero for both stacks at 12 v 3. That is the
+honest result, already stated in §14.5: the fleet is below the strength needed for simultaneous
+three-hostile containment. The architecture wins that engagement by sequencing wings onto each
+arrest, and the comparison remains decisive on clean arrests, hull strikes, collisions, role
+continuity, tracking accuracy and fleet survival.

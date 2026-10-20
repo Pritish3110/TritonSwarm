@@ -38,13 +38,6 @@ D_LAUNCH_WINDOW = 2.0     # seconds of column discipline after launch
 H_COMBAT_LOSS = 0.25
 H_DEGRADED = 0.55
 
-# Longest horizon over which a hostile's current velocity may be extrapolated. The hostiles
-# weave on a ~3 s period and switch tactic (evade / burst / relief run) every few seconds, so
-# their velocity is only predictive for a short window. Extrapolating further does not produce
-# a better intercept, it produces a thrashing aim point: a 54 s projection of an evading target
-# swings tens of metres per tick and the fleet mills about instead of transiting.
-T_MANEUVER_HORIZON = 8.0
-
 # Guidance gains.
 PN_GAIN = 3.0             # proportional navigation constant (classic 3-5)
 ORBIT_CONVERGE_GAIN = 2.0 # radial convergence aggressiveness of the orbit course field
@@ -425,68 +418,6 @@ def transit_waypoint(
     nx = -dy / dist
     ny = dx / dist
     return (station[0] + nx * offset, station[1] + ny * offset)
-
-
-def lead_station(
-    own_pos: Tuple[float, float],
-    station: Tuple[float, float],
-    target_vel: Tuple[float, float],
-    speed_capability: float = MAX_SURGE,
-    max_time: float = T_MANEUVER_HORIZON,
-) -> Tuple[float, float]:
-    """
-    Projects a ring station forward along the hostile's velocity by the time it will actually
-    take to reach it, solved exactly.
-
-    A station orbiting a moving hostile TRANSLATES while the vessel is still transiting toward
-    it. Aiming at where the station is right now produces a stern chase: the vessel closes at
-    only (own speed - hostile speed), arrives behind the hostile, and the whole fleet strings
-    out on one bearing instead of encircling. Aiming at where the station WILL BE lets the
-    vessel cut the corner and arrive on the beam or ahead, which is what closes an encirclement.
-
-    Time-to-go is the positive root of the standard interception quadratic
-
-        |R + v*t| = s*t   ->   (|v|^2 - s^2) t^2 + 2(R.v) t + |R|^2 = 0,   R = station - own,
-
-    which is exact rather than iterative. When the hostile is as fast as the vessel the
-    quadratic has no useful root and the lead falls back to the bounded horizon.
-
-    The solution is then CLAMPED to the hostile's manoeuvre horizon (`max_time`). The exact
-    intercept time for a long transit can be tens of seconds, but the hostile's present
-    velocity is not predictive that far ahead -- it weaves and changes tactic continuously --
-    so an unclamped lead makes the aim point thrash and the fleet mills about instead of
-    closing. A short, repeatedly re-solved lead is both stable and sufficient: the vessel
-    re-plans every tick, so the lead shrinks continuously as the geometry improves.
-    """
-    rx = station[0] - own_pos[0]
-    ry = station[1] - own_pos[1]
-    dist = math.hypot(rx, ry)
-    if dist < 1e-6:
-        return station
-
-    vx, vy = target_vel
-    speed = max(speed_capability, 0.5)
-
-    a = vx * vx + vy * vy - speed * speed
-    b = 2.0 * (rx * vx + ry * vy)
-    c = dist * dist
-
-    t_go = min(max_time, dist / speed)
-    if abs(a) > 1e-9:
-        disc = b * b - 4.0 * a * c
-        if disc >= 0.0:
-            root = math.sqrt(disc)
-            candidates = [t for t in ((-b + root) / (2.0 * a), (-b - root) / (2.0 * a))
-                          if t > 1e-6]
-            if candidates:
-                t_go = min(min(candidates), max_time)
-    elif abs(b) > 1e-9:
-        # Degenerate: hostile speed equals own speed, so the quadratic collapses to a line.
-        linear = -c / b
-        if linear > 1e-6:
-            t_go = min(linear, max_time)
-
-    return (station[0] + vx * t_go, station[1] + vy * t_go)
 
 
 def circulation_for_station(station_bearing: float, reference_heading: float) -> float:

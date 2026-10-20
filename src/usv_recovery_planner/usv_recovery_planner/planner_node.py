@@ -50,7 +50,6 @@ from usv_recovery_planner.establishment import (
     TargetState,
     audit_manning,
     build_slot_lattice,
-    containment_ring_verdict,
     group_wings,
     merged_pairs,
     resolve_establishment,
@@ -66,13 +65,6 @@ D_DEFUSE_LOCK = 7.5          # interceptor range that sustains the EMP defusal l
 D_DEFUSE_BREAK = 9.5         # range at which the lock decays
 T_DEFUSE = 4.0               # seconds of sustained lock for a full defusal
 T_DEBOUNCE = 2.0             # seconds all criteria must hold for mission success
-T_CONTAINMENT_HOLD = 1.0     # seconds the ring must hold before the strike is authorized
-# Closing an encirclement on a fleeing hostile is dominated by the FAR-SIDE trackers, which
-# must overtake it. With a 3.5 m/s fleet against a 1.95 m/s hostile the net margin is only
-# ~1.55 m/s, so a ring station on the far side of a 20 m ring at an 85 m standoff is ~125 m of
-# path: roughly 70-80 s. A shorter timeout fires before the ring can physically form and the
-# wing would always strike under degraded containment.
-T_CONTAINMENT_TIMEOUT = 85.0 # seconds after which a wing strikes under degraded containment
 H_ANOMALY = 0.55             # health that triggers a fault anomaly event
 H_RESTORED = 0.80            # health that triggers a self-healing restoration event
 D_COLLISION = 4.0            # hard inter-ally collision invariant
@@ -135,12 +127,6 @@ class USVRecoveryPlannerNode(Node):
         self.defusal_progress: Dict[int, float] = {m: 0.0 for m in range(self.num_targets)}
         self.lock_announced: Dict[int, bool] = {m: False for m in range(self.num_targets)}
         self.pincer_progress: Dict[int, float] = {m: 0.0 for m in range(self.num_targets)}
-        # Strike authorization: the strike element stages astern until the containment element
-        # is in position, so the encirclement the mission calls for actually forms.
-        self.containment_hold: Dict[int, float] = {m: 0.0 for m in range(self.num_targets)}
-        self.engagement_clock: Dict[int, float] = {m: 0.0 for m in range(self.num_targets)}
-        self.strike_authorized: Dict[int, bool] = {m: False for m in range(self.num_targets)}
-        self.strike_auth_logged: Dict[int, bool] = {m: False for m in range(self.num_targets)}
         self.debounce_timer: Dict[int, float] = {m: 0.0 for m in range(self.num_targets)}
         self.arrest_logged: Dict[int, bool] = {m: False for m in range(self.num_targets)}
         self.collision_occurred = False
@@ -394,16 +380,13 @@ class USVRecoveryPlannerNode(Node):
                 self.suppress_retention = True
             self._report_establishment(wings)
 
-        # 3. Authorize each wing's strike once its containment ring is established, then walk
-        #    the ring in for any wing whose interceptor has closed.
-        self._update_strike_authorization(dt, targets)
+        # 3. Walk the containment ring in for any wing whose interceptor has closed.
         self._update_pincer(dt, wings)
 
         # 4. Build the slot lattice and solve the complete agent -> slot matching.
         collapse = {w.wing_id: max(self.pincer_progress.get(t, 0.0) for t in w.target_ids)
                     for w in wings}
-        slots = build_slot_lattice(self.establishment, wings, collapse_progress=collapse,
-                                   strike_authorized=self.strike_authorized)
+        slots = build_slot_lattice(self.establishment, wings, collapse_progress=collapse)
 
         if len(slots) != len(agent_ids):
             # Defensive: re-resolve against the current wings and rebuild immediately rather
@@ -414,8 +397,7 @@ class USVRecoveryPlannerNode(Node):
             self.establishment = resolve_establishment(
                 len(fit_ids), wings, num_casualties=len(agent_ids) - len(fit_ids)
             )
-            slots = build_slot_lattice(self.establishment, wings, collapse_progress=collapse,
-                                       strike_authorized=self.strike_authorized)
+            slots = build_slot_lattice(self.establishment, wings, collapse_progress=collapse)
             if len(slots) != len(agent_ids):
                 self.get_logger().error(
                     f"Slot lattice still {len(slots)} != fleet {len(agent_ids)}; skipping tick."
@@ -464,68 +446,6 @@ class USVRecoveryPlannerNode(Node):
 
         # 6. Mission verification, per hostile and in aggregate.
         self._verify_mission(dt, targets, wings)
-
-    def _update_strike_authorization(self, dt: float, targets) -> None:
-        """
-        Releases a wing's strike element only once its containment ring is established.
-
-        An interceptor released immediately simply runs the hostile down on its own, and the
-        encirclement the mission is specified around never forms. The ring is judged over the
-        CONTAINMENT element only, so the strike cannot authorize itself.
-
-        A fleet below the strength needed for a ring (fewer than three trackers on the wing)
-        would otherwise deadlock, so after T_CONTAINMENT_TIMEOUT the wing is released under
-        explicitly degraded containment rather than never engaging at all.
-        """
-        for t in targets:
-            m = t.target_id
-            if t.neutralized:
-                self.strike_authorized[m] = True
-                continue
-
-            self.engagement_clock[m] += dt
-
-            trackers = [
-                self.agent_positions[aid]
-                for aid, role in self.agent_roles.items()
-                if role == ROLE_TRACKER
-                and self.agent_wings.get(aid) == m
-                and aid in self.agent_positions
-                and self.agent_health.get(aid, 1.0) >= 0.30
-                and 8.0 <= math.hypot(self.agent_positions[aid][0] - t.x,
-                                      self.agent_positions[aid][1] - t.y) <= 30.0
-            ]
-            established, n, max_gap, thresh = containment_ring_verdict((t.x, t.y), trackers)
-
-            if established:
-                self.containment_hold[m] += dt
-            else:
-                self.containment_hold[m] = max(0.0, self.containment_hold[m] - 0.5 * dt)
-
-            if self.strike_authorized[m]:
-                continue
-
-            if self.containment_hold[m] >= T_CONTAINMENT_HOLD:
-                self.strike_authorized[m] = True
-                if not self.strike_auth_logged[m]:
-                    self.strike_auth_logged[m] = True
-                    self.get_logger().info(
-                        f"\n[STRIKE AUTHORIZED] >>> HOSTILE-{m}: containment ring established "
-                        f"with {n} trackers (max gap {max_gap:.2f} <= {thresh:.2f} rad). "
-                        f"Releasing the strike element from its staging station to the "
-                        f"terminal capture corridor."
-                    )
-            elif self.engagement_clock[m] >= T_CONTAINMENT_TIMEOUT:
-                self.strike_authorized[m] = True
-                if not self.strike_auth_logged[m]:
-                    self.strike_auth_logged[m] = True
-                    self.get_logger().warning(
-                        f"\n[STRIKE AUTHORIZED - DEGRADED] >>> HOSTILE-{m}: no containment ring "
-                        f"after {T_CONTAINMENT_TIMEOUT:.0f}s ({n} tracker(s) on station, "
-                        f"max gap {max_gap:.2f} rad). The fleet is below the strength needed to "
-                        f"ring this hostile, so the strike element is released without full "
-                        f"containment rather than never engaging."
-                    )
 
     def _update_pincer(self, dt: float, wings) -> None:
         """Ramps the containment squeeze for each wing whose interceptor has closed to strike range."""
@@ -728,9 +648,6 @@ class USVRecoveryPlannerNode(Node):
         if self.hostile_neutralized[m]:
             # An arrest is permanent: hold the lock reading so every consumer agrees.
             self.defusal_timer[m] = T_DEFUSE
-        elif not self.strike_authorized[m]:
-            # Strike element still staging: no lock may accumulate before containment.
-            self.defusal_timer[m] = max(0.0, self.defusal_timer[m] - 0.4 * dt)
         elif d_int <= D_DEFUSE_LOCK:
             self.defusal_timer[m] += dt
             if not self.lock_announced[m]:
@@ -843,9 +760,8 @@ class USVRecoveryPlannerNode(Node):
             c2_flag = "ARR" if v['arrested_hull'] else ("OK " if v['c2'] else "NO ")
             state = ("DEFUSED/ARRESTED" if t.neutralized else
                      ("EMP LOCK ENGAGED" if pct > 0 else
-                      ("PINCER SQUEEZE" if self.pincer_progress[t.target_id] > 0.05 else
-                       ("CONTAINMENT" if self.strike_authorized[t.target_id]
-                        else "ESTABLISHING RING"))))
+                      ("PINCER SQUEEZE" if self.pincer_progress[t.target_id] > 0.05
+                       else "CONTAINMENT")))
             lines.append(
                 f" HOST-{t.target_id:<2} | {('FLAGSHIP' if t.target_id == 0 else 'ESCORT'):<8} | "
                 f"({t.x:7.1f},{t.y:7.1f}) | {v['trailing_speed']:4.2f}m/s | "
@@ -909,11 +825,8 @@ class USVRecoveryPlannerNode(Node):
                 state = "ARREST GUARD 12m"
             elif role == ROLE_INTERCEPTOR:
                 pct = int(self.defusal_progress.get(wing, 0.0))
-                if not self.strike_authorized.get(wing, True):
-                    state = f"STAGING 22m (awaiting containment {self.containment_hold.get(wing, 0.0):.1f}s)"
-                else:
-                    state = (f"EMP DEFUSAL {pct}%" if pct > 0 else
-                             ("TERMINAL STRIKE RUN" if d_t <= 12.0 else "ATTACK VECTOR (PN LEAD)"))
+                state = (f"EMP DEFUSAL {pct}%" if pct > 0 else
+                         ("TERMINAL STRIKE RUN" if d_t <= 12.0 else "ATTACK VECTOR (PN LEAD)"))
             elif role == ROLE_TRACKER:
                 squeeze = self.pincer_progress.get(wing, 0.0)
                 state = (f"PINCER SQUEEZE {squeeze*100:3.0f}%" if squeeze > 0.05

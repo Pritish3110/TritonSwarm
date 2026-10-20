@@ -89,7 +89,6 @@ FIT_AT_CASUALTY_PENALTY = 1.0e4   # a fit vessel should not park at a rear casua
 R_RING_BASE = 20.0
 R_RING_PINCER_FLOOR = 15.5   # just outside the shield's 14.0 m non-interceptor envelope
 R_STERN_CORRIDOR = 4.8
-R_STRIKE_STAGING = 22.0   # where the strike element waits until containment is established
 R_ARREST_GUARD = 15.5
 R_MESH_BACKBONE = 30.0
 R_PICKET = 45.0
@@ -491,7 +490,6 @@ def build_slot_lattice(
     establishment: Establishment,
     wings: Sequence[Wing],
     collapse_progress: Dict[int, float] | None = None,
-    strike_authorized: Dict[int, bool] | None = None,
     engagement_center: Optional[Tuple[float, float]] = None,
     engagement_heading: float = 0.0,
 ) -> List[Slot]:
@@ -502,7 +500,6 @@ def build_slot_lattice(
     stern corridors, containment rings, arrest guards, mesh backbone, pickets, casualties.
     """
     collapse = collapse_progress or {}
-    authorized = strike_authorized if strike_authorized is not None else {}
     slots: List[Slot] = []
     wing_by_id = {w.wing_id: w for w in wings}
 
@@ -526,11 +523,6 @@ def build_slot_lattice(
         if wing is None:
             continue
         count = establishment.interceptors[wing_id]
-        # The strike element STAGES astern until the containment element is in position. An
-        # interceptor released early simply arrests the hostile on its own, and the
-        # encirclement the mission actually calls for never forms.
-        radius = (R_STERN_CORRIDOR if authorized.get(wing.primary_target_id, True)
-                  else R_STRIKE_STAGING)
         for k in range(count):
             # A second interceptor on the same wing attacks from the opposite quarter.
             bearing = wrap_angle(wing.ref_heading + math.pi + (0.0 if k == 0 else 0.7 * (-1) ** k))
@@ -538,11 +530,11 @@ def build_slot_lattice(
                 key=f"int:w{wing_id}:#{k}",
                 role=ROLE_INTERCEPTOR,
                 kind=KIND_STERN,
-                point=(wing.center[0] + radius * math.cos(bearing),
-                       wing.center[1] + radius * math.sin(bearing)),
+                point=(wing.center[0] + R_STERN_CORRIDOR * math.cos(bearing),
+                       wing.center[1] + R_STERN_CORRIDOR * math.sin(bearing)),
                 target_id=wing.primary_target_id,
                 phase_angle=bearing,
-                ring_radius=radius,
+                ring_radius=R_STERN_CORRIDOR,
             ))
 
     # 2. Containment ring stations, phase-locked to the hostile's heading.
@@ -639,32 +631,6 @@ def build_slot_lattice(
         ))
 
     return slots
-
-
-def containment_ring_verdict(
-    target_pos: Tuple[float, float],
-    tracker_positions: Sequence[Tuple[float, float]],
-    gap_tolerance: float = 1.60,
-) -> Tuple[bool, int, float, float]:
-    """
-    Section 5 criterion 2 evaluated over the CONTAINMENT element only.
-
-    The interceptor is deliberately excluded: it is the element being authorized, so counting
-    it as a containment participant would let the strike authorize itself. Returns
-    (established, participants, max_gap, gap_threshold).
-    """
-    bearings = sorted(
-        math.atan2(ty - target_pos[1], tx - target_pos[0])
-        for tx, ty in tracker_positions
-    )
-    n = len(bearings)
-    if n < 3:
-        return False, n, 2.0 * math.pi, 0.0
-
-    gaps = [(bearings[(k + 1) % n] - bearings[k]) % (2.0 * math.pi) for k in range(n)]
-    max_gap = max(gaps)
-    threshold = (2.0 * math.pi / n) * gap_tolerance
-    return (max_gap <= threshold), n, max_gap, threshold
 
 
 def _nearest_target_id(wings: Sequence[Wing], point: Tuple[float, float]) -> int:

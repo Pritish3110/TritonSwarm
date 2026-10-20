@@ -42,20 +42,16 @@ from usv_recovery_planner.establishment import (  # noqa: E402
     TargetState,
     audit_manning,
     build_slot_lattice,
-    containment_ring_verdict,
     group_wings,
     merged_pairs,
     pincer_ring_radius,
     R_ARREST_GUARD,
-    R_STRIKE_STAGING,
     WING_SPLIT_RADIUS,
     resolve_establishment,
     solve_assignment,
 )
 from usv_policy_marl.guidance import (  # noqa: E402
     GuidancePhase,
-    T_MANEUVER_HORIZON,
-    lead_station,
     orbit_vector_field,
     standoff_orbit_command,
     phase_error,
@@ -1354,171 +1350,6 @@ def test_ring_stations_stay_evenly_phased_under_full_pincer_collapse():
 
     # And that spacing satisfies the Section 5 gap criterion with margin.
     assert max(gaps) <= (2.0 * math.pi / n) * 1.60
-
-
-def test_lead_station_projects_a_translating_station_forward():
-    """
-    A ring station orbiting a moving hostile translates while the vessel transits toward it.
-    Aiming at its current position is a stern chase; the aim point must lead it.
-    """
-    own = (-85.0, 0.0)
-    station = (0.0, 20.0)
-    moving = lead_station(own, station, target_vel=(1.9, 0.0))
-    still = lead_station(own, station, target_vel=(0.0, 0.0))
-
-    assert still == station, "A stationary hostile needs no lead"
-    assert moving[0] > station[0], "The aim point must lead a hostile making way"
-
-    # Over a long transit the exact intercept time far exceeds the manoeuvre horizon, so the
-    # lead must be clamped to it rather than extrapolating an evading hostile 50+ s ahead.
-    assert moving[0] == pytest.approx(station[0] + 1.9 * T_MANEUVER_HORIZON, abs=1e-6)
-
-
-def test_lead_station_closes_faster_than_chasing_it():
-    """Flying the lead point must reach a translating station sooner than chasing it."""
-    def time_to_arrive(use_lead):
-        pos = [-85.0, 0.0]
-        psi = 0.0
-        station = [0.0, 20.0]
-        tvel = (1.9, 0.0)
-        dt = 0.05
-        for step in range(4000):
-            station[0] += tvel[0] * dt
-            aim = (lead_station((pos[0], pos[1]), (station[0], station[1]), tvel)
-                   if use_lead else (station[0], station[1]))
-            heading_err = wrap_angle(math.atan2(aim[1] - pos[1], aim[0] - pos[0]) - psi)
-            psi = wrap_angle(psi + float(np.clip(heading_err * 2.2, -0.8, 0.8)) * dt)
-            speed = 3.5 * max(0.2, math.cos(heading_err))
-            pos[0] += speed * math.cos(psi) * dt
-            pos[1] += speed * math.sin(psi) * dt
-            if math.hypot(pos[0] - station[0], pos[1] - station[1]) < 4.0:
-                return step * dt
-        return float('inf')
-
-    led = time_to_arrive(True)
-    chased = time_to_arrive(False)
-    assert led < chased, f"Leading ({led:.1f}s) must beat chasing ({chased:.1f}s)"
-
-
-def test_lead_station_caps_the_projection():
-    """A near-stationary approach must not project an absurd lead."""
-    far = lead_station((-5000.0, 0.0), (0.0, 0.0), target_vel=(2.0, 0.0),
-                       speed_capability=0.6, max_time=30.0)
-    assert far[0] <= 2.0 * 30.0 + 1e-6
-
-
-# ---------------------------------------------------------------------------
-# 11. Strike authorization gated on containment
-# ---------------------------------------------------------------------------
-def test_containment_ring_verdict_needs_three_trackers():
-    """Below three containment vessels the ring geometry is not meaningful."""
-    for n in (0, 1, 2):
-        established, count, gap, thresh = containment_ring_verdict(
-            (0.0, 0.0), [(20.0 * math.cos(2 * math.pi * k / 3), 20.0 * math.sin(2 * math.pi * k / 3))
-                         for k in range(n)]
-        )
-        assert not established
-        assert count == n
-
-
-def test_containment_ring_verdict_passes_on_an_even_ring_and_fails_on_a_clump():
-    even = [(20.0 * math.cos(2 * math.pi * k / 4), 20.0 * math.sin(2 * math.pi * k / 4))
-            for k in range(4)]
-    established, n, gap, thresh = containment_ring_verdict((0.0, 0.0), even)
-    assert established and n == 4
-    assert gap == pytest.approx(math.pi / 2.0, abs=1e-6)
-
-    clumped = [(20.0 * math.cos(0.15 * k), 20.0 * math.sin(0.15 * k)) for k in range(4)]
-    established_bad, _, gap_bad, _ = containment_ring_verdict((0.0, 0.0), clumped)
-    assert not established_bad
-    assert gap_bad > math.pi
-
-
-def test_strike_element_stages_astern_until_containment_is_established():
-    """
-    An interceptor released immediately runs the hostile down on its own and the encirclement
-    the mission is specified around never forms. The strike slot must therefore sit at the
-    staging radius until the wing's ring is in position, and only then at the capture corridor.
-    """
-    targets = _targets(1)
-    wings = group_wings(targets)
-    est = resolve_establishment(12, wings)
-
-    staged = build_slot_lattice(est, wings, strike_authorized={0: False})
-    released = build_slot_lattice(est, wings, strike_authorized={0: True})
-
-    stern_staged = next(s for s in staged if s.kind == "stern")
-    stern_released = next(s for s in released if s.kind == "stern")
-    centre = wings[0].center
-
-    r_staged = math.hypot(stern_staged.point[0] - centre[0], stern_staged.point[1] - centre[1])
-    r_released = math.hypot(stern_released.point[0] - centre[0], stern_released.point[1] - centre[1])
-
-    assert r_staged == pytest.approx(R_STRIKE_STAGING, abs=1e-6)
-    assert r_released == pytest.approx(4.8, abs=1e-6)
-    assert r_staged > r_released
-    # Staging must sit outside the shield's exclusion envelope so the shield does not fight it.
-    assert r_staged > D_EXCLUSION
-
-    # Defaulting to authorized keeps the lattice usable without the gate wired up.
-    assert math.hypot(*next(s for s in build_slot_lattice(est, wings) if s.kind == "stern").point) \
-        == pytest.approx(4.8, abs=1e-6)
-
-
-def test_only_the_named_wing_is_released():
-    """Strike authorization is per wing: one hostile's ring must not release another's strike."""
-    targets = _targets(2)
-    wings = group_wings(targets)
-    est = resolve_establishment(10, wings)
-    slots = build_slot_lattice(est, wings, strike_authorized={0: True, 1: False})
-
-    by_wing = {s.target_id: s for s in slots if s.kind == "stern"}
-    centres = {w.primary_target_id: w.center for w in wings}
-
-    r0 = math.hypot(by_wing[0].point[0] - centres[0][0], by_wing[0].point[1] - centres[0][1])
-    r1 = math.hypot(by_wing[1].point[0] - centres[1][0], by_wing[1].point[1] - centres[1][1])
-    assert r0 == pytest.approx(4.8, abs=1e-6)
-    assert r1 == pytest.approx(R_STRIKE_STAGING, abs=1e-6)
-
-
-def test_lead_is_bounded_to_the_manoeuvre_horizon():
-    """
-    Regression for the aim-point thrash that made the fleet mill about instead of transiting.
-    The hostiles weave on a ~3 s period, so their velocity is not predictive over the tens of
-    seconds the exact intercept solution asks for on a long transit.
-    """
-    assert T_MANEUVER_HORIZON <= 12.0, "A longer horizon than this is not predictive"
-
-    station = (0.0, 20.0)
-    for own_x in (-40.0, -85.0, -150.0, -400.0):
-        aim = lead_station((own_x, 0.0), station, target_vel=(1.95, 0.0))
-        lead_distance = aim[0] - station[0]
-        assert 0.0 <= lead_distance <= 1.95 * T_MANEUVER_HORIZON + 1e-6, (
-            f"Lead of {lead_distance:.1f} m from {own_x} m exceeds the manoeuvre horizon"
-        )
-
-
-def test_lead_aim_point_is_stable_against_a_weaving_hostile():
-    """
-    The aim point must not swing wildly as a weaving hostile's heading oscillates. This is the
-    property that was violated: with a 60 s horizon the aim point moved tens of metres per
-    tick, so the fleet never settled onto a transit course and visibly milled about.
-    """
-    own = (-85.0, 0.0)
-    station = (0.0, 20.0)
-    speed = 1.95
-
-    aims = []
-    for k in range(200):
-        t = k * 0.05
-        # Hostile weaving exactly as hostile_ai drives it.
-        psi = 0.20 * math.sin(2.0 * t)
-        aims.append(lead_station(own, station, (speed * math.cos(psi), speed * math.sin(psi))))
-
-    swings = [math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(aims, aims[1:])]
-    assert max(swings) < 0.5, (
-        f"Aim point swings up to {max(swings):.2f} m per tick against a weaving hostile"
-    )
 
 
 def test_wing_switch_penalty_dominates_inter_wing_distance_differences():

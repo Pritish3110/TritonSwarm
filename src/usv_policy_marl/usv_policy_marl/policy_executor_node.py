@@ -40,7 +40,6 @@ from usv_policy_marl.guidance import (
     GuidancePhase,
     facing_factor,
     heading_rate_cmd,
-    lead_station,
     proportional_navigation,
     select_phase,
     speed_profile,
@@ -364,14 +363,12 @@ class USVPolicyExecutorNode(Node):
                 u_geo = sol.desired_speed
 
             else:
-                # Transit, deployment and support stationkeeping. The station is projected
-                # forward along the hostile's velocity first: chasing where the station is now
-                # is a stern chase that strings the fleet out on one bearing and never closes
-                # the encirclement.
-                aim = lead_station((x, y), slot, (tvx, tvy))
+                # Transit, deployment and support stationkeeping: drive the published
+                # station, offset into a wing lane while still far out.
+                aim = slot
                 if phase in (GuidancePhase.LAUNCH, GuidancePhase.TRANSIT):
                     aim = transit_waypoint(
-                        (x, y), aim,
+                        (x, y), slot,
                         lane_index=lane_index.get(i, 0),
                         lane_count=max(1, len(wing_members.get(wing, [i]))),
                     )
